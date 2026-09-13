@@ -1,0 +1,18 @@
+Browser dashboard: pending
+Real-time full risk snapshot: pending
+VIX data integration: pending
+ATR/trend calculation from Angel data: pending
+Account balance and margin check: pending
+Open positions and P&L tracking: pending
+Long-running scheduler: pending
+Automatic market-open/market-close handling: pending
+Instrument/token resolver: pending
+Order status and fill confirmation: pending
+Duplicate-order protection: pending
+Emergency kill switch: pending
+Audit log for decisions/orders: pending
+Full project dependency installation: pending
+Full test suite verification: pending
+Paper trading with real-time Angel data: pending
+Final live trading rollout test: pending
+

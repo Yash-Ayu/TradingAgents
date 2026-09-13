@@ -1,0 +1,9 @@
+Angel login: complete
+Market data: complete
+Paper trading smoke: complete
+Risk blocking: complete
+Live adapter: guarded and tested
+Scheduled monitor: basic one-cycle complete
+Browser dashboard: pending
+Full risk snapshot: pending
+Long-running scheduler: pending
