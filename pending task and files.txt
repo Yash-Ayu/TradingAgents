@@ -1,18 +1,23 @@
-Browser dashboard: pending
-Real-time full risk snapshot: pending
-VIX data integration: pending
-ATR/trend calculation from Angel data: pending
-Account balance and margin check: pending
-Open positions and P&L tracking: pending
-Long-running scheduler: pending
-Automatic market-open/market-close handling: pending
-Instrument/token resolver: pending
-Order status and fill confirmation: pending
-Duplicate-order protection: pending
-Emergency kill switch: pending
-Audit log for decisions/orders: pending
-Full project dependency installation: pending
-Full test suite verification: pending
-Paper trading with real-time Angel data: pending
-Final live trading rollout test: pending
+﻿Updated 2026-09-17. Details and run commands: PROJECT_STATUS.md.
 
+DONE: New-PC environment and version-pinned Windows dependency snapshot.
+DONE: Full suite 816 passed, 2 skipped; lint, dependency and wheel checks.
+DONE: Browser desk verified on desktop/mobile with no console errors.
+DONE: Continuous paper scheduler with bounded backoff and stop controls.
+DONE: Read-only Angel quote/VIX/candle/account/order-book integration (mock verified).
+DONE: Exact instrument-master resolution, lot/expiry and freshness checks.
+DONE: Deterministic ATR/trend plus paper drawdown/daily-loss checks.
+DONE: Existing engine hook and constrained long-only paper sizing.
+DONE: Persistent paper cash, positions, P&L, orders and audit history.
+DONE: Restart-safe paper duplicate guard and persistent emergency stop.
+DONE: Calendar-driven sessions and fresh-data paper flattening near close.
+DONE: Removed default BUY orders, old runtime dates and fake live fills.
+
+INPUTS REQUIRED: Credentials, chosen tradable symbol, matching research ticker,
+current instrument master and verified exchange calendar.
+UNVERIFIED: Authenticated Angel read-only checks and live-market paper soak test.
+PENDING: Automatic authoritative calendar/master refresh.
+PENDING: Multi-instrument/relative allocation policy and realistic fill/cost model.
+PENDING: Separate live execution state machine, reconciliation/cancellation,
+real margin checks and live stop/flatten integration. No live rollout performed.
+DEFERRED: .env and environment-template work as requested.

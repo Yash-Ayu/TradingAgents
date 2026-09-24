@@ -85,6 +85,7 @@ class TradingAgentsGraph:
         debug=False,
         config: dict[str, Any] = None,
         callbacks: list | None = None,
+        api_key: str | None = None,
     ):
         """Initialize the trading agents graph and components.
 
@@ -107,6 +108,8 @@ class TradingAgentsGraph:
 
         # Initialize LLMs with provider-specific thinking configuration
         llm_kwargs = self._get_provider_kwargs()
+        if api_key:
+            llm_kwargs["api_key"] = api_key
 
         # Add callbacks to kwargs if provided (passed to LLM constructor)
         if self.callbacks:
@@ -278,8 +281,8 @@ class TradingAgentsGraph:
 
         ``benchmark`` is the index used as the alpha baseline (resolved by the
         caller via ``_resolve_benchmark``). Returns ``(raw_return, alpha_return,
-        holding_days, resolution_date)`` — where ``resolution_date`` is the date
-        of the last price bar used, i.e. when the outcome became known (#1251) —
+        holding_days, resolution_date)`` â€” where ``resolution_date`` is the date
+        of the last price bar used, i.e. when the outcome became known (#1251) â€”
         or ``(None, None, None, None)`` when the outcome cannot be settled yet:
         the full holding window has not traded (#1169), or the symbol is delisted
         or unreachable.
@@ -313,7 +316,7 @@ class TradingAgentsGraph:
             )
             alpha = raw - bench_ret
             # The date of the last price bar used is when this outcome became
-            # known — the point-in-time cutoff for injecting the lesson (#1251).
+            # known â€” the point-in-time cutoff for injecting the lesson (#1251).
             resolution_date = stock.index[holding_days].strftime("%Y-%m-%d")
             return raw, alpha, holding_days, resolution_date
         except Exception as e:
@@ -344,7 +347,7 @@ class TradingAgentsGraph:
                 ticker, entry["date"], benchmark=benchmark,
             )
             if raw is None:
-                continue  # price not available yet — try again next run
+                continue  # price not available yet â€” try again next run
             reflection = self.reflector.reflect_on_final_decision(
                 final_decision=entry.get("decision", ""),
                 raw_return=raw,
@@ -401,11 +404,11 @@ class TradingAgentsGraph:
             f"asset={asset_type}",
         ])
 
-    def propagate(self, company_name, trade_date, asset_type: str = "stock"):
+    def propagate(self, company_name, trade_date, asset_type: str = "stock", intraday_context: dict | None = None):
         """Run the trading agents graph for a company on a specific date.
 
         ``asset_type`` selects between the stock pipeline (default) and the
-        crypto pipeline (``"crypto"``) shipped in #567 — the CLI auto-detects
+        crypto pipeline (``"crypto"``) shipped in #567 â€” the CLI auto-detects
         from the ticker; programmatic callers pass it explicitly. When
         ``checkpoint_enabled`` is set in config, the graph is recompiled with
         a per-ticker SqliteSaver so a crashed run can resume from the last
@@ -421,6 +424,12 @@ class TradingAgentsGraph:
 
         # Resolve any pending memory-log entries for this ticker before the pipeline runs.
         self._resolve_pending_entries(company_name)
+
+        if intraday_context is not None:
+            if self.config.get("checkpoint_enabled"):
+                raise ValueError("intraday_checkpoint_resume_not_supported")
+            return self._run_graph(company_name, trade_date, asset_type=asset_type,
+                                   intraday_context=intraday_context)
 
         with self.checkpoint_scope(company_name, trade_date, asset_type) as thread_id_value:
             return self._run_graph(
@@ -507,9 +516,9 @@ class TradingAgentsGraph:
         return write_report_tree(final_state, ticker, save_path)
 
     def _run_graph(self, company_name, trade_date, asset_type: str = "stock",
-                   checkpoint_thread_id: str | None = None):
+                   checkpoint_thread_id: str | None = None, intraday_context: dict | None = None):
         """Execute the graph and write the resulting state to disk and memory log."""
-        # Initialize state — inject memory log context for PM and the
+        # Initialize state â€” inject memory log context for PM and the
         # deterministically resolved instrument identity for all agents. On a
         # historical run, gate lessons to those whose outcome was known by the
         # trade date so a backtest can't learn from the future (#1251).
@@ -517,6 +526,18 @@ class TradingAgentsGraph:
             company_name, as_of=self._memory_as_of(trade_date)
         )
         instrument_context = self.resolve_instrument_context(company_name, asset_type)
+        if intraday_context is not None:
+            instrument_context += (
+                "\nINTRADAY SESSION ONLY: make a same-session Buy/Hold/Sell decision. "
+                "No overnight investment thesis, averaging down or unbounded exposure. "
+                "The supplied timestamped broker snapshot and completed one-minute candles "
+                "are the intraday reference. Daily research tools provide background only; "
+                "do not substitute their daily price for this snapshot. Hold if intraday "
+                "evidence is insufficient or conflicting. Treat existing long positions "
+                "as exposure to manage; Sell means reduce/exit, not open a short. "
+                "Execution enforces independent stop/target/session checks.\n"
+                + json.dumps(intraday_context, allow_nan=False)
+            )
         init_agent_state = self.propagator.create_initial_state(
             company_name,
             trade_date,

@@ -12,4 +12,4 @@ def test_local_server_starts_and_returns_status():
 
 
 def test_runtime_main_starts_service():
-    assert main() == 0
+    assert main(["--health"]) == 0

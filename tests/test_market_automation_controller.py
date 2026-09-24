@@ -16,7 +16,7 @@ def test_market_automation_controller_blocks_risky_snapshot():
     assert result["action"] == "flatten"
 
 
-def test_market_automation_controller_routes_safe_paper_trade():
+def test_market_automation_controller_blocks_without_engine_decision():
     controller = MarketAutomationController(broker_name="paper")
 
     result = controller.tick({
@@ -27,7 +27,6 @@ def test_market_automation_controller_routes_safe_paper_trade():
         "atr_ratio": 0.7,
     }, symbol="NIFTY")
 
-    assert result["status"] == "accepted"
-    assert result["broker"] == "paper"
-    assert result["mode"] == "paper"
-    assert result["action"] == "monitor"
+    assert result["status"] == "blocked"
+    assert result["reason"] == "no_actionable_engine_decision"
+    assert result["action"] == "hold"

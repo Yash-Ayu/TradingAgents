@@ -9,12 +9,12 @@ def test_market_order_gateway_rejects_brokerless_orders():
     assert result["reason"] == "broker_not_configured"
 
 
-def test_market_order_gateway_accepts_configured_broker():
+def test_market_order_gateway_rejects_missing_price():
     gateway = MarketOrderGateway(broker_name="paper")
     result = gateway.place_order({"symbol": "NIFTY", "side": "buy", "qty": 10})
 
-    assert result["status"] == "accepted"
-    assert result["broker"] == "paper"
+    assert result["status"] == "rejected"
+    assert result["reason"] == "invalid_paper_order"
 
 
 def test_market_order_gateway_simulates_paper_fill():

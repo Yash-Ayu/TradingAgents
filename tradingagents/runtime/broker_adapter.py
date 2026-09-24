@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
-
 
 SUPPORTED_BROKERS = {"paper", "angel", "angel_one", "zerodha", "upstox"}
 
@@ -42,13 +42,23 @@ class PaperBrokerAdapter:
         self.broker_name = self.config.normalized_broker_name
 
     def place_order(self, order: dict[str, Any]) -> dict[str, Any]:
-        qty = int(order.get("qty", 0) or 0)
-        if qty <= 0:
+        try:
+            qty = int(order.get("qty", 0))
+            price = float(order.get("price", 0))
+            valid = (
+                not isinstance(order.get("qty"), bool)
+                and str(qty) == str(order.get("qty")) and qty > 0
+                and not isinstance(order.get("price"), bool)
+                and math.isfinite(price) and price > 0
+                and str(order.get("side", "")).lower() in {"buy", "sell"}
+                and bool(order.get("symbol"))
+            )
+        except (TypeError, ValueError, OverflowError):
+            valid = False
+        if not valid:
             return {
-                "status": "rejected",
-                "reason": "invalid_quantity",
-                "symbol": order.get("symbol"),
-                "broker": self.broker_name,
+                "status": "rejected", "reason": "invalid_paper_order",
+                "symbol": order.get("symbol"), "broker": self.broker_name,
             }
 
         fill = {
@@ -97,28 +107,14 @@ class LiveBrokerAdapter:
                 "mode": "live",
             }
 
-        qty = int(order.get("qty", 0) or 0)
-        fill = {
-            "status": "filled",
+        return {
+            "status": "rejected",
+            "reason": "live_order_not_implemented",
             "symbol": order.get("symbol"),
-            "side": order.get("side"),
-            "qty": qty,
-            "price": order.get("price"),
-            "order_type": order.get("order_type", "market"),
+            "broker": self.broker_name,
             "mode": "live",
         }
 
-        return {
-            "status": "accepted",
-            "broker": self.broker_name,
-            "mode": "live",
-            "symbol": order.get("symbol"),
-            "side": order.get("side"),
-            "qty": qty,
-            "filled_qty": qty,
-            "order_id": str(uuid4()),
-            "fills": [fill],
-        }
 
 
 class AngelOneBrokerAdapter:
@@ -159,9 +155,9 @@ class AngelOneBrokerAdapter:
 
         try:
             quantity = int(order.get("qty", 0))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             quantity = 0
-        if quantity <= 0 or quantity > config.max_order_qty:
+        if isinstance(order.get("qty"), bool) or str(order.get("qty")) != str(quantity) or quantity <= 0 or quantity > config.max_order_qty:
             return self._rejected("quantity_limit_exceeded", order)
 
         required = ("exchange", "tradingsymbol", "symboltoken")
@@ -171,10 +167,17 @@ class AngelOneBrokerAdapter:
         order_type = str(order.get("order_type", "MARKET")).upper()
         if order_type not in {"MARKET", "LIMIT"}:
             return self._rejected("unsupported_order_type", order)
-        price = float(order.get("price", 0) or 0)
-        if order_type == "LIMIT" and price <= 0:
-            return self._rejected("limit_price_required", order)
-        if price > 0 and price * quantity > config.max_order_value:
+        if str(order.get("side", "")).upper() not in {"BUY", "SELL"}:
+            return self._rejected("invalid_side", order)
+        try:
+            price = float(order.get("price", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return self._rejected("invalid_price", order)
+        if not math.isfinite(price) or price <= 0:
+            return self._rejected("positive_reference_price_required", order)
+        if not math.isfinite(config.max_order_value) or config.max_order_value <= 0:
+            return self._rejected("invalid_value_limit", order)
+        if price * quantity > config.max_order_value:
             return self._rejected("order_value_limit_exceeded", order)
 
         try:
@@ -206,6 +209,9 @@ class AngelOneBrokerAdapter:
         except Exception as exc:
             return self._rejected(f"broker_order_error:{type(exc).__name__}", order)
 
+        if not isinstance(broker_order_id, str) or not broker_order_id.strip():
+            return self._rejected("broker_order_unconfirmed", order)
+
         return {
             "status": "accepted",
             "broker": self.broker_name,
@@ -225,9 +231,9 @@ def create_broker_adapter(
         return PaperBrokerAdapter(cfg)
     if broker_name == "angel":
         return AngelOneBrokerAdapter(cfg)
-    if broker_name in {"angel", "zerodha", "upstox"}:
+    if broker_name in {"zerodha", "upstox"}:
         return LiveBrokerAdapter(cfg)
-    return PaperBrokerAdapter(cfg)
+    raise ValueError("unsupported_broker")
 
 
 def connect_broker(
@@ -269,6 +275,12 @@ def connect_broker(
             "adapter": "PaperBrokerAdapter",
         }
 
+    if normalized != "angel":
+        return {
+            "status": "not_implemented", "broker": normalized, "mode": "live",
+            "reason": "live_broker_not_implemented",
+        }
+
     credentials_ready = (
         all([api_key, client_id, mpin, totp_secret])
         if normalized == "angel"
@@ -284,7 +296,8 @@ def connect_broker(
 
     adapter = create_broker_adapter(cfg)
     return {
-        "status": "connected",
+        "status": "configured",
+        "reason": "broker_authentication_required",
         "broker": adapter.broker_name,
         "mode": "live",
         "adapter": adapter.__class__.__name__,

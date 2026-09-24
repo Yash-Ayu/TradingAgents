@@ -46,4 +46,4 @@ def test_engine_bridge_runs_when_safe():
     assert result["allowed"] is True
     assert result["action"] == "monitor"
     assert result["decision"] == "BUY"
-    graph.propagate.assert_called_once_with("NIFTY", "2025-01-01", "2026-09-01")
+    graph.propagate.assert_called_once_with("NIFTY", "2026-09-01", asset_type="stock")

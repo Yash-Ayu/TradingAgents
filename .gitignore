@@ -219,6 +219,16 @@ __marimo__/
 # Cache
 **/data_cache/
 
-# Enterprise env file (secrets) and generated run reports
-.env.enterprise
+# Enterprise and local env files (secrets), credentials, and generated run reports
+.env
+.env.*
+!.env.enterprise.example
+*.pem
+*.key
+*.token
+*.credentials
 reports/
+
+# Local paper account and audit databases
+/runtime_state/
+.vscode/

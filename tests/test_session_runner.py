@@ -11,6 +11,6 @@ def test_session_runner_cycle_is_safe_and_returns_state():
         "atr_ratio": 0.7,
     }, symbol="NIFTY")
 
-    assert result["status"] == "accepted"
-    assert result["broker"] == "paper"
-    assert result["mode"] == "paper"
+    assert result["status"] == "blocked"
+    assert result["reason"] == "no_actionable_engine_decision"
+    assert result["action"] == "hold"

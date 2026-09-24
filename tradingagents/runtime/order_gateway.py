@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from typing import Any
-from uuid import uuid4
+
+from .broker_adapter import PaperBrokerAdapter
 
 
 class MarketOrderGateway:
     """Broker adapter facade for a safe intraday order-management layer.
 
-    The gateway intentionally doesn’t place real orders unless a broker is
+    The gateway intentionally doesnâ€™t place real orders unless a broker is
     configured. This makes the runtime safe by default and allows a future broker
     adapter to be plugged in without changing the rest of the app logic.
     """
@@ -46,28 +47,4 @@ class MarketOrderGateway:
                 "qty": order.get("qty"),
             }
 
-        qty = self._coerce_qty(order.get("qty"))
-        mode = "paper"
-        fill = {
-            "status": "filled",
-            "symbol": order.get("symbol"),
-            "side": order.get("side"),
-            "qty": qty,
-            "price": order.get("price"),
-            "order_type": order.get("order_type", "market"),
-            "mode": mode,
-        }
-
-        return {
-            "status": "accepted",
-            "broker": self.broker_name,
-            "mode": mode,
-            "symbol": order.get("symbol"),
-            "side": order.get("side"),
-            "qty": qty,
-            "filled_qty": qty,
-            "order_id": str(uuid4()),
-            "price": order.get("price"),
-            "order_type": order.get("order_type", "market"),
-            "fills": [fill],
-        }
+        return PaperBrokerAdapter().place_order(order)

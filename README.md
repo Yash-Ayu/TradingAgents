@@ -94,6 +94,16 @@ Our framework decomposes complex trading tasks into specialized roles.
   <img src="assets/risk.png" width="70%" style="display: inline-block; margin: 0 2%;">
 </p>
 
+## Local paper trading desk
+
+Run `python -m tradingagents.runtime` from the installed environment and open
+http://127.0.0.1:8765. The desk starts paused with clearly labeled synthetic demo
+data. It provides a scheduler, persistent paper positions/orders, audit history,
+and an emergency stop. Live execution is not exposed by this dashboard.
+
+See [PROJECT_STATUS.md](PROJECT_STATUS.md) for Windows setup commands, verified
+checks, read-only Angel data configuration, and the remaining live-rollout work.
+
 ## Installation and CLI
 
 ### Installation

@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import date, datetime, time
 from typing import Any
+from zoneinfo import ZoneInfo
 
-from .scheduler import MarketScheduler
 from .safe_runtime import SafeTradingRuntime
+from .scheduler import MarketScheduler
 
 
 class MarketSessionMonitor:
     """Track Indian market open/close windows for intraday trading."""
 
-    def __init__(self, market_id: str = "india_nse") -> None:
+    def __init__(self, market_id: str = "india_nse", holidays: set[date] | None = None) -> None:
         self.market_id = market_id
         self.market_hours = {
             "india_nse": {"open": time(9, 15), "close": time(15, 30)},
@@ -18,9 +19,18 @@ class MarketSessionMonitor:
             "us_nasdaq": {"open": time(9, 30), "close": time(16, 0)},
         }
 
+        if market_id not in self.market_hours:
+            raise ValueError(f"Unsupported market: {market_id}")
+        self.timezone = ZoneInfo("America/New_York" if market_id == "us_nasdaq" else "Asia/Kolkata")
+        self.holidays = set(holidays or ())
+
     def is_market_open(self, current_time: datetime | None = None) -> bool:
-        now = current_time or datetime.now()
-        hours = self.market_hours.get(self.market_id, {"open": time(9, 15), "close": time(15, 30)})
+        now = current_time or datetime.now(self.timezone)
+        if now.tzinfo is not None:
+            now = now.astimezone(self.timezone)
+        if now.weekday() >= 5 or now.date() in self.holidays:
+            return False
+        hours = self.market_hours[self.market_id]
         return hours["open"] <= now.time() < hours["close"]
 
 
@@ -50,7 +60,7 @@ class TradingDashboard:
             "status": runtime_status["status"],
             "market_open": market_open,
             "risk_state": runtime_status["risk_state"],
-            "allow_trade": runtime_status["allow_trade"],
+            "allow_trade": market_open and runtime_status["allow_trade"],
             "flatten_positions": runtime_status["flatten_positions"],
             "scheduler_status": scheduler_status,
             "reasons": runtime_status["reasons"],

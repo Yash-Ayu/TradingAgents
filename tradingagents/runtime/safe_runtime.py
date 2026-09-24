@@ -9,6 +9,7 @@ configured thresholds.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 
@@ -70,7 +71,7 @@ class RiskGate:
             snapshot = {}
 
         reasons: list[str] = []
-        is_market_open = self._as_bool(snapshot.get("is_market_open"), default=True)
+        is_market_open = self._as_bool(snapshot.get("is_market_open"), default=False)
 
         if not is_market_open:
             return {
@@ -81,10 +82,25 @@ class RiskGate:
                 "market_open": False,
             }
 
-        vix = self._as_float(snapshot.get("vix"), default=0.0)
-        drawdown = self._as_float(snapshot.get("drawdown_pct"), default=0.0)
-        trend_strength = self._as_float(snapshot.get("trend_strength"), default=1.0)
-        atr_ratio = self._as_float(snapshot.get("atr_ratio"), default=0.0)
+        values = {
+            key: self._as_float(snapshot.get(key), default=float("nan"))
+            for key in ("vix", "drawdown_pct", "trend_strength", "atr_ratio")
+        }
+        invalid = [
+            key for key, value in values.items()
+            if isinstance(snapshot.get(key), bool) or not math.isfinite(value) or value < 0
+        ]
+        if values["trend_strength"] > 1:
+            invalid.append("trend_strength")
+        if invalid:
+            return {
+                "risk_state": "unknown",
+                "allow_trade": False,
+                "flatten_positions": False,
+                "reasons": ["Missing or invalid risk data: " + ", ".join(invalid)],
+                "market_open": True,
+            }
+        vix, drawdown, trend_strength, atr_ratio = values.values()
 
         if vix >= self.vix_high:
             reasons.append("VIX is above the hard-stop threshold")
@@ -151,13 +167,7 @@ class SafeTradingRuntime:
     def __init__(self, gate: RiskGate | None = None) -> None:
         self.gate = gate or RiskGate()
         self.status = "stopped"
-        self.last_snapshot: dict[str, Any] = {
-            "is_market_open": True,
-            "vix": 18.0,
-            "drawdown_pct": 3.0,
-            "trend_strength": 0.8,
-            "atr_ratio": 0.7,
-        }
+        self.last_snapshot: dict[str, Any] = {}
 
     def start(self) -> str:
         self.status = "running"
@@ -176,7 +186,7 @@ class SafeTradingRuntime:
         return {
             "status": self.status,
             "risk_state": evaluation["risk_state"],
-            "allow_trade": evaluation["allow_trade"],
+            "allow_trade": self.status == "running" and evaluation["allow_trade"],
             "flatten_positions": evaluation["flatten_positions"],
             "reasons": evaluation["reasons"],
             "last_snapshot": self.last_snapshot,
@@ -185,4 +195,4 @@ class SafeTradingRuntime:
     def can_trade(self, snapshot: dict[str, Any] | None = None) -> bool:
         if snapshot is not None:
             self.last_snapshot = snapshot
-        return self.gate.should_allow_trade(self.last_snapshot)
+        return self.status == "running" and self.gate.should_allow_trade(self.last_snapshot)

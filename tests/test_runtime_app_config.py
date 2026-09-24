@@ -11,7 +11,7 @@ def test_single_config_connects_selected_broker():
     )
 
     result = config.connect()
-    assert result["status"] == "connected"
+    assert result["status"] == "not_implemented"
     assert result["broker"] == "zerodha"
     assert result["mode"] == "live"
 

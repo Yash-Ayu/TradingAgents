@@ -15,7 +15,7 @@ def test_trade_router_rejects_without_broker_and_risk_clearance():
     assert result["action"] == "flatten"
 
 
-def test_trade_router_accepts_safe_brokered_trade():
+def test_trade_router_blocks_without_engine_decision():
     router = TradeRouter(broker_name="paper")
     result = router.route({
         "is_market_open": True,
@@ -25,7 +25,6 @@ def test_trade_router_accepts_safe_brokered_trade():
         "atr_ratio": 0.7,
     }, symbol="NIFTY")
 
-    assert result["status"] == "accepted"
-    assert result["broker"] == "paper"
-    assert result["mode"] == "paper"
-    assert result["fills"][0]["status"] == "filled"
+    assert result["status"] == "blocked"
+    assert result["reason"] == "no_actionable_engine_decision"
+    assert result["action"] == "hold"

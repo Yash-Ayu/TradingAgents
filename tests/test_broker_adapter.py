@@ -1,4 +1,4 @@
-from tradingagents.runtime.broker_adapter import PaperBrokerAdapter, BrokerAdapterConfig
+from tradingagents.runtime.broker_adapter import BrokerAdapterConfig, PaperBrokerAdapter
 
 
 def test_paper_broker_adapter_accepts_and_fills_order():
@@ -11,9 +11,9 @@ def test_paper_broker_adapter_accepts_and_fills_order():
     assert result["fills"][0]["status"] == "filled"
 
 
-def test_live_broker_adapter_requires_credentials():
+def test_paper_broker_rejects_missing_price():
     adapter = PaperBrokerAdapter(BrokerAdapterConfig())
     result = adapter.place_order({"symbol": "BANKNIFTY", "side": "sell", "qty": 5})
 
-    assert result["status"] == "accepted"
-    assert result["broker"] == "paper"
+    assert result["status"] == "rejected"
+    assert result["reason"] == "invalid_paper_order"

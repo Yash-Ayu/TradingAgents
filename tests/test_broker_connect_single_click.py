@@ -1,4 +1,4 @@
-from tradingagents.runtime.broker_adapter import connect_broker, BrokerAdapterConfig
+from tradingagents.runtime.broker_adapter import connect_broker
 
 
 def test_connect_broker_single_click_for_paper_and_live():
@@ -12,7 +12,7 @@ def test_connect_broker_single_click_for_paper_and_live():
 
     assert paper["status"] == "connected"
     assert paper["mode"] == "paper"
-    assert live["status"] == "connected"
+    assert live["status"] == "not_implemented"
     assert live["broker"] == "zerodha"
     assert live["mode"] == "live"
 

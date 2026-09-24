@@ -6,8 +6,8 @@ from tradingagents.runtime import MarketSessionMonitor, TradingDashboard
 def test_market_session_monitor_detects_market_hours():
     monitor = MarketSessionMonitor("india_nse")
 
-    open_time = datetime(2026, 9, 12, 9, 15, 0)
-    close_time = datetime(2026, 9, 12, 15, 31, 0)
+    open_time = datetime(2026, 9, 11, 9, 15, 0)
+    close_time = datetime(2026, 9, 11, 15, 31, 0)
 
     assert monitor.is_market_open(open_time) is True
     assert monitor.is_market_open(close_time) is False

@@ -42,6 +42,7 @@ def valid_order(**overrides):
         "symboltoken": "99926000",
         "order_type": "MARKET",
         "risk_approved": True,
+        "price": 23400,
     }
     order.update(overrides)
     return order

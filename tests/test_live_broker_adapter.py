@@ -1,4 +1,4 @@
-from tradingagents.runtime.broker_adapter import LiveBrokerAdapter, BrokerAdapterConfig
+from tradingagents.runtime.broker_adapter import BrokerAdapterConfig, LiveBrokerAdapter
 
 
 def test_live_broker_adapter_requires_credentials():
@@ -9,7 +9,7 @@ def test_live_broker_adapter_requires_credentials():
     assert result["reason"] == "credentials_missing"
 
 
-def test_live_broker_adapter_accepts_configured_live_order():
+def test_live_broker_adapter_rejects_unimplemented_live_order():
     adapter = LiveBrokerAdapter(BrokerAdapterConfig(
         broker_name="zerodha",
         api_key="demo_key",
@@ -18,7 +18,8 @@ def test_live_broker_adapter_accepts_configured_live_order():
     ))
     result = adapter.place_order({"symbol": "NIFTY", "side": "buy", "qty": 10, "price": 24500})
 
-    assert result["status"] == "accepted"
+    assert result["status"] == "rejected"
     assert result["mode"] == "live"
     assert result["broker"] == "zerodha"
-    assert result["filled_qty"] == 10
+    assert result["reason"] == "live_order_not_implemented"
+    assert "fills" not in result

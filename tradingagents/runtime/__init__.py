@@ -1,5 +1,10 @@
 from .app_config import AppRuntimeConfig, launch_trading_app
-from .broker_adapter import BrokerAdapterConfig, LiveBrokerAdapter, PaperBrokerAdapter, connect_broker
+from .broker_adapter import (
+    BrokerAdapterConfig,
+    LiveBrokerAdapter,
+    PaperBrokerAdapter,
+    connect_broker,
+)
 from .browser_dashboard import BrowserDashboard
 from .controller import MarketAutomationController
 from .dashboard import LocalTradingDashboard

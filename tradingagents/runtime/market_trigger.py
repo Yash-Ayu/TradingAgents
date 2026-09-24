@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .engine_bridge import SafeTradingEngineBridge
+from .engine_bridge import SafeTradingEngineBridge, resolve_trade_date
 
 
 class MarketTriggerLoop:
@@ -12,9 +12,17 @@ class MarketTriggerLoop:
         self.bridge = bridge or SafeTradingEngineBridge()
 
     def evaluate(self, snapshot: dict[str, Any], symbol: str = "NIFTY") -> dict[str, Any]:
+        try:
+            trade_date = resolve_trade_date(snapshot)
+        except ValueError as exc:
+            return {
+                "symbol": symbol, "allowed": False, "action": "hold",
+                "status": "invalid_analysis_context", "risk_state": "unknown",
+                "reasons": [str(exc)], "decision": None,
+            }
         return self.bridge.run(
             symbol=symbol,
-            start_date="2025-01-01",
-            end_date="2026-09-01",
+            start_date=trade_date,
+            end_date=trade_date,
             snapshot=snapshot,
         )

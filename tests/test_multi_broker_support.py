@@ -15,7 +15,7 @@ def test_create_broker_adapter_supports_all_requested_brokers():
         assert adapter.broker_name == expected
 
 
-def test_live_broker_adapter_accepts_configured_zerodha_and_upstox():
+def test_live_broker_adapter_rejects_unimplemented_zerodha_and_upstox():
     zerodha = create_broker_adapter(BrokerAdapterConfig(
         broker_name="zerodha",
         api_key="key",
@@ -29,8 +29,8 @@ def test_live_broker_adapter_accepts_configured_zerodha_and_upstox():
         base_url="https://example.com",
     ))
 
-    assert zerodha.place_order({"symbol": "NIFTY", "side": "buy", "qty": 5})["status"] == "accepted"
-    assert upstox.place_order({"symbol": "BANKNIFTY", "side": "sell", "qty": 3})["status"] == "accepted"
+    assert zerodha.place_order({"symbol": "NIFTY", "side": "buy", "qty": 5})["status"] == "rejected"
+    assert upstox.place_order({"symbol": "BANKNIFTY", "side": "sell", "qty": 3})["status"] == "rejected"
 
 
 def test_live_broker_adapter_rejects_angel_without_credentials():
