@@ -16,6 +16,7 @@ import os
 import re
 import threading
 import time
+from contextlib import suppress
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -118,10 +119,8 @@ class AngelOneMarketAdapter(MarketDataAdapter):
     def _reset_session(self):
         """Discard stale Angel session/provider so next request authenticates fresh."""
         if self._provider is not None:
-            try:
+            with suppress(Exception):
                 self._provider.disconnect()
-            except Exception:
-                pass
         self._provider = None
 
         if self._client is not None:

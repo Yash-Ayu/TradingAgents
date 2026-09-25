@@ -39,6 +39,7 @@ dev = [
     "ruff>=0.15",
     "pytest>=8.0",
     "pytest-subtests>=0.13",
+    "playwright>=1.55.0",
 ]
 angelone = [
     "smartapi-python>=1.5.5",
