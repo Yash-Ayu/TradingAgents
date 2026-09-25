@@ -115,6 +115,18 @@ class AngelOneMarketAdapter(MarketDataAdapter):
         self._client = client
         return self._client
 
+    def _reset_session(self):
+        """Discard stale Angel session/provider so next request authenticates fresh."""
+        if self._provider is not None:
+            try:
+                self._provider.disconnect()
+            except Exception:
+                pass
+        self._provider = None
+
+        if self._client is not None:
+            self._client._is_authenticated = False
+
     def _get_provider(self):
         if self._provider is not None:
             return self._provider
@@ -285,6 +297,25 @@ class AngelOneMarketAdapter(MarketDataAdapter):
         # 2. Fall back to REST quote snapshot
         client = self._get_client()
         resp = client.get_market_data(mode='FULL', exchange_tokens={exchange: [token]})
+
+        # Angel sessions can expire while this long-running service stays alive.
+        # On an explicit auth-token failure, discard stale session state,
+        # authenticate once with a fresh TOTP, and retry this read-only request once.
+        error_code = str(resp.get('errorcode', '')) if resp else ''
+        error_message = str(resp.get('message', '')) if resp else ''
+        auth_expired = error_code == 'AG8001' or 'invalid token' in error_message.lower()
+
+        if auth_expired:
+            logger.warning("Angel One session expired; re-authenticating read-only market data session.")
+            self._reset_session()
+            client = self._get_client()
+            auth_res = client.authenticate()
+            if not auth_res.get('status'):
+                raise ValueError(
+                    f"Angel One re-authentication failed: {auth_res.get('message', 'unknown error')}"
+                )
+            resp = client.get_market_data(mode='FULL', exchange_tokens={exchange: [token]})
+
         if not resp or not resp.get('status'):
             raise ValueError(f"Failed to fetch Angel One quote: {resp.get('message') if resp else 'empty'}")
 
