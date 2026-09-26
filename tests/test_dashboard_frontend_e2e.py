@@ -300,3 +300,75 @@ def test_dashboard_frontend_full_e2e(running_dashboard):
 
     assert not errors, f"Browser Console Errors occurred: {errors}"
 
+
+@pytest.mark.parametrize(
+    ("width", "height", "device_name"),
+    [
+        (320, 568, "iPhone SE 1st gen / Compact"),
+        (360, 640, "Standard Android small"),
+        (375, 667, "iPhone SE 2nd/3rd gen"),
+        (390, 844, "iPhone 12/13/14"),
+        (412, 915, "Samsung Galaxy / Pixel"),
+        (430, 932, "iPhone 14/15/16 Pro Max"),
+        (768, 1024, "iPad / Tablet Portrait"),
+        (1440, 900, "Desktop HD"),
+    ],
+)
+def test_mobile_responsive_viewports(running_dashboard, width, height, device_name):
+    """
+    Verifies mobile responsive layout across all standard device viewports:
+    - Zero document-level horizontal overflow (scrollWidth <= clientWidth + 1)
+    - Runner card prioritized above main-area on mobile viewports (<= 768px)
+    - Onboarding steps wrap cleanly without collision/overlap
+    - Desktop grid layout preserved on wide viewports (1440px)
+    - Zero browser console errors
+    """
+    errors = []
+    server_url = running_dashboard.origin
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(viewport={"width": width, "height": height})
+        page = context.new_page()
+
+        page.on("console", lambda msg: errors.append(f"Console {msg.type}: {msg.text}") if msg.type == "error" else None)
+        page.on("pageerror", lambda err: errors.append(f"Page Error: {err}"))
+
+        page.goto(server_url, wait_until="networkidle")
+        page.wait_for_timeout(300)
+
+        # 1. Zero document-level horizontal overflow
+        overflow = page.evaluate("() => document.documentElement.scrollWidth - document.documentElement.clientWidth")
+        assert overflow <= 1, (
+            f"Horizontal page overflow detected at {width}px ({device_name}): "
+            f"scrollWidth={page.evaluate('() => document.documentElement.scrollWidth')}, "
+            f"clientWidth={page.evaluate('() => document.documentElement.clientWidth')}"
+        )
+
+        # 2. Layout checks
+        if width <= 768:
+            # Runner card should be visually prioritized above main area
+            runner_box = page.locator(".runner-card").bounding_box()
+            main_box = page.locator(".main-area").bounding_box()
+            assert runner_box and main_box, "Runner card and main area must exist"
+            assert runner_box["y"] < main_box["y"], (
+                f"Runner card should have high priority above main-area on mobile at {width}px: "
+                f"runner_y={runner_box['y']}, main_y={main_box['y']}"
+            )
+
+            # Onboarding steps should stack vertically without overlap
+            steps = page.locator(".step-card").all()
+            assert len(steps) == 3, f"Should have 3 onboarding step cards, got {len(steps)}"
+            boxes = [s.bounding_box() for s in steps]
+            assert boxes[0]["y"] + boxes[0]["height"] <= boxes[1]["y"] + 2, "Step 1 and 2 overlap"
+            assert boxes[1]["y"] + boxes[1]["height"] <= boxes[2]["y"] + 2, "Step 2 and 3 overlap"
+        else:
+            # Desktop layout preservation
+            workspace_cols = page.evaluate(
+                "() => window.getComputedStyle(document.querySelector('.workspace')).gridTemplateColumns.split(' ').length"
+            )
+            assert workspace_cols == 3, f"Desktop should have 3 columns, got {workspace_cols}"
+
+        browser.close()
+
+    assert not errors, f"Browser errors occurred at {width}px ({device_name}): {errors}"
