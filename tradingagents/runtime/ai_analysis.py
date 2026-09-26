@@ -32,7 +32,7 @@ class AIAnalysis:
         self.error = None
         self._try_auto_configure_from_env()
 
-    def _try_auto_configure_from_env(self):
+    def _try_auto_configure_from_env(self) -> bool:
         """Auto-configure if valid AI API keys exist in environment without exposing secrets."""
         try:
             from dotenv import load_dotenv
@@ -49,7 +49,7 @@ class AIAnalysis:
                 self._api_key = gkey.strip()
                 self.state = 'ready'
                 self.progress = 'AI connected (Google Gemini 3.6). Stock select karke Analyze dabayein.'
-                return
+                return True
 
             # 2. OpenAI
             okey = os.environ.get('OPENAI_API_KEY')
@@ -63,7 +63,7 @@ class AIAnalysis:
                 self._api_key = okey.strip()
                 self.state = 'ready'
                 self.progress = 'AI connected (OpenAI). Stock select karke Analyze dabayein.'
-                return
+                return True
 
             # 3. Anthropic
             akey = os.environ.get('ANTHROPIC_API_KEY')
@@ -77,9 +77,10 @@ class AIAnalysis:
                 self._api_key = akey.strip()
                 self.state = 'ready'
                 self.progress = 'AI connected (Anthropic Claude). Stock select karke Analyze dabayein.'
-                return
+                return True
         except Exception:
             pass
+        return False
 
     @staticmethod
     def _build_graph(config, api_key):
@@ -98,17 +99,43 @@ class AIAnalysis:
         from tradingagents.llm_clients.api_key_env import get_api_key_env
         if not isinstance(body, dict) or set(body) - {'provider', 'model', 'api_key', 'base_url'}:
             raise ValueError('invalid_ai_settings')
+
+        # If body is empty or lacks provider, try auto-configuring from environment/.env
+        if not body or not body.get('provider'):
+            with self.lock:
+                if self.auto_active or (self.worker and self.worker.is_alive()):
+                    raise ValueError('analysis_still_running')
+                if self._try_auto_configure_from_env():
+                    self.generation += 1
+                    self.error = None
+                    self.result = None
+                    return self.status()
+            raise ValueError('unsupported_ai_provider')
+
         provider = body.get('provider')
         model = body.get('model')
         if not isinstance(provider, str) or provider not in PROVIDERS:
             raise ValueError('unsupported_ai_provider')
         if not isinstance(model, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,199}', model):
             raise ValueError('model_id_required')
-        key = body.get('api_key') or os.environ.get(get_api_key_env(provider) or '')
+
+        key = body.get('api_key')
+        if not key or not str(key).strip():
+            try:
+                from dotenv import load_dotenv
+                load_dotenv()
+            except Exception:
+                pass
+            env_var = get_api_key_env(provider)
+            key = os.environ.get(env_var or '')
+            if not key and provider == 'google':
+                key = os.environ.get('GEMINI_API_KEY')
+
         if key is not None and (not isinstance(key, str) or len(key) > 4096):
             raise ValueError('invalid_api_key')
         if provider != 'ollama' and (not key or key.strip().lower() in {'placeholder', 'your_api_key'}):
             raise ValueError('api_key_required')
+        key = key.strip() if key else key
         endpoint = body.get('base_url') or None
         if endpoint is not None and not isinstance(endpoint, str):
             raise ValueError('invalid_endpoint')

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 from .angel_data import AngelReadOnlyFeed, DemoFeed
@@ -28,6 +29,7 @@ def main(argv=None) -> int:
     parser.add_argument('--vix-symbol', help='Exact India VIX symbol in the instrument master')
     parser.add_argument('--analysis-symbol', help='Research ticker corresponding to the selected instrument')
     parser.add_argument('--engine', action='store_true', help='Enable configured LLM research (API usage)')
+    parser.add_argument('--auto-start', action='store_true', default=None, help='Automatically start paper trading loop')
     parser.add_argument('--once', action='store_true', help='Run one cycle and exit')
     parser.add_argument('--max-order-value', type=float, default=10000)
     parser.add_argument('--max-order-qty', type=int, default=50)
@@ -70,7 +72,28 @@ def main(argv=None) -> int:
         finally:
             service.close()
     server = DashboardServer(service, host=args.host, port=args.port)
-    print(f'Paper desk: {server.origin} | source={args.source} | starts paused', flush=True)
+    auto_start_env = os.environ.get('TRADINGAGENTS_AUTO_START', '').strip().lower() in {'1', 'true', 'yes'}
+    should_auto_start = args.auto_start if args.auto_start is not None else auto_start_env
+    if should_auto_start and not service.ledger.killed():
+        try:
+            if args.source == 'angel':
+                symbol = args.analysis_symbol
+                if not symbol and service.instrument.exchange == 'NSE' and service.instrument.instrument_type == 'EQ':
+                    symbol = service.instrument.symbol.removesuffix('-EQ') + '.NS'
+                if symbol:
+                    service.start_auto({'symbol': symbol})
+                    print(f'Paper desk: {server.origin} | source={args.source} | auto-started ({symbol})', flush=True)
+                else:
+                    service.start()
+                    print(f'Paper desk: {server.origin} | source={args.source} | auto-started', flush=True)
+            else:
+                service.start()
+                print(f'Paper desk: {server.origin} | source={args.source} | auto-started', flush=True)
+        except Exception as exc:
+            print(f'Paper desk: {server.origin} | source={args.source} | auto-start skipped: {exc}', flush=True)
+    else:
+        status_msg = 'starts paused (emergency stop latched)' if service.ledger.killed() else 'starts paused'
+        print(f'Paper desk: {server.origin} | source={args.source} | {status_msg}', flush=True)
     try:
         server.serve_forever(poll_interval=0.2)
     except KeyboardInterrupt:

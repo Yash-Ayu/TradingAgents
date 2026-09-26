@@ -9,6 +9,7 @@ from urllib.request import Request, urlopen
 
 import pytest
 
+from tradingagents.runtime.ai_analysis import AIAnalysis
 from tradingagents.runtime.angel_data import AngelReadOnlyFeed, DemoFeed
 from tradingagents.runtime.dashboard_server import DashboardServer
 from tradingagents.runtime.market_snapshot import (
@@ -405,4 +406,194 @@ def test_direct_paper_paths_cannot_fake_invalid_fills(qty, price):
         result = adapter.place_order({'symbol': 'TEST', 'side': 'buy', 'qty': qty, 'price': price})
         assert result['status'] == 'rejected'
         assert 'fills' not in result
+
+
+def test_api_auto_start_and_stop(ledger, clock):
+    calendar = SessionCalendar({'year': 2026})
+    service = PaperTradingService(RealSource(), ledger, calendar=calendar, clock=lambda: clock[0])
+    server = DashboardServer(service, host='127.0.0.1', port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        def post(endpoint, data):
+            headers = {'Content-Type': 'application/json', 'X-Control-Token': server.control_token}
+            req = Request(f'{server.origin}/api/{endpoint}', data=json.dumps(data).encode(), headers=headers)
+            with urlopen(req, timeout=3) as resp:
+                return json.load(resp)
+
+        # Initial state is paused
+        status = service.status()
+        assert not status['auto_enabled']
+        assert status['status'] == 'stopped'
+
+        # Auto start with correct symbol
+        res = post('auto/start', {'symbol': 'DEMO.NS'})
+        assert res['auto_enabled'] is True
+        assert res['status'] == 'running'
+        assert service.auto_enabled is True
+        assert service.running is True
+
+        # Stop resets both running and auto_enabled
+        res_stop = post('stop', {})
+        assert res_stop['auto_enabled'] is False
+        assert res_stop['status'] == 'stopped'
+        assert service.auto_enabled is False
+        assert service.running is False
+    finally:
+        service.stop()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_ai_disconnect_and_reconnect_from_env(monkeypatch):
+    monkeypatch.setenv('GOOGLE_API_KEY', 'test-google-key-secure')
+    ai = AIAnalysis()
+    assert ai.state == 'ready'
+    assert ai.config['llm_provider'] == 'google'
+
+    # Disconnect clears credentials and state
+    ai.disconnect()
+    assert ai.state == 'not_configured'
+    assert ai.config is None
+
+    # Empty body configure restores from env
+    ai.configure({})
+    assert ai.state == 'ready'
+    assert ai.config['llm_provider'] == 'google'
+
+    # Disconnect and configure with provider/model but blank api_key restores key from env
+    ai.disconnect()
+    ai.configure({'provider': 'google', 'model': 'gemini-3.6-flash'})
+    assert ai.state == 'ready'
+    assert ai.config['deep_think_llm'] == 'gemini-3.6-flash'
+
+    # Placeholder key is rejected
+    ai.disconnect()
+    with pytest.raises(ValueError, match='api_key_required'):
+        ai.configure({'provider': 'google', 'model': 'gemini-3.6-flash', 'api_key': 'placeholder'})
+
+
+def test_angel_order_execution_apis_hard_blocked():
+    from tradingagents.integrations.angel_one.client import AngelOneClient
+
+    client = AngelOneClient('fake_api_key', 'fake_client_id', '1234', 'fake_totp')
+    with pytest.raises(NotImplementedError, match='strictly prohibited'):
+        client.place_order(symbol='SBIN', qty=1)
+    with pytest.raises(NotImplementedError, match='strictly prohibited'):
+        client.modify_order(order_id='123')
+    with pytest.raises(NotImplementedError, match='strictly prohibited'):
+        client.cancel_order(order_id='123')
+
+
+def test_main_auto_start_logic(tmp_path, monkeypatch):
+    from unittest.mock import patch
+
+    from tradingagents.runtime.__main__ import main
+    from tradingagents.runtime.paper_ledger import PaperLedger
+
+    db_path = tmp_path / 'test_main.sqlite3'
+
+    # 1. Default without flag: starts paused
+    with patch('tradingagents.runtime.__main__.DashboardServer') as mock_server_cls:
+        mock_instance = mock_server_cls.return_value
+        mock_instance.origin = 'http://127.0.0.1:8765'
+        default_state = {}
+
+        def check_default(*args, **kwargs):
+            svc = mock_server_cls.call_args[0][0]
+            default_state['running'] = svc.running
+            default_state['auto_enabled'] = svc.auto_enabled
+            raise KeyboardInterrupt()
+
+        mock_instance.serve_forever.side_effect = check_default
+
+        main(['--db', str(db_path), '--source', 'demo'])
+        assert default_state['running'] is False
+        assert default_state['auto_enabled'] is False
+
+    # 2. With TRADINGAGENTS_AUTO_START=1: auto-starts demo
+    monkeypatch.setenv('TRADINGAGENTS_AUTO_START', '1')
+    with patch('tradingagents.runtime.__main__.DashboardServer') as mock_server_cls:
+        mock_instance = mock_server_cls.return_value
+        mock_instance.origin = 'http://127.0.0.1:8765'
+        auto_state = {}
+
+        def check_auto(*args, **kwargs):
+            svc = mock_server_cls.call_args[0][0]
+            auto_state['running'] = svc.running
+            raise KeyboardInterrupt()
+
+        mock_instance.serve_forever.side_effect = check_auto
+
+        main(['--db', str(db_path), '--source', 'demo'])
+        assert auto_state['running'] is True
+
+    # 3. With CLI --auto-start and angel source
+    monkeypatch.delenv('TRADINGAGENTS_AUTO_START', raising=False)
+    master_file = tmp_path / 'master.json'
+    calendar_file = tmp_path / 'calendar.json'
+    master_file.write_text(json.dumps([
+        {'exch_seg': 'NSE', 'symbol': 'SBIN-EQ', 'token': '3045', 'lotsize': 1, 'instrumenttype': 'EQ'},
+        {'exch_seg': 'NSE', 'symbol': 'INDIA_VIX', 'token': '999', 'lotsize': 1, 'instrumenttype': 'INDEX'},
+    ]), encoding='utf-8')
+    calendar_file.write_text(json.dumps({'year': 2026}), encoding='utf-8')
+
+    with patch('tradingagents.runtime.__main__.DashboardServer') as mock_server_cls, \
+         patch('tradingagents.runtime.__main__.AngelReadOnlyFeed') as mock_feed_cls:
+        from tradingagents.runtime.market_snapshot import Instrument
+        mock_feed = mock_feed_cls.return_value
+        mock_feed.source = 'angel'
+        mock_feed.instrument = Instrument('NSE', 'SBIN-EQ', '3045', 1, 'EQ')
+        mock_feed.connected = True
+        mock_instance = mock_server_cls.return_value
+        mock_instance.origin = 'http://127.0.0.1:8765'
+        angel_state = {}
+
+        def check_angel(*args, **kwargs):
+            svc = mock_server_cls.call_args[0][0]
+            angel_state['running'] = svc.running
+            angel_state['auto_enabled'] = svc.auto_enabled
+            angel_state['symbol'] = svc.analysis_symbol
+            raise KeyboardInterrupt()
+
+        mock_instance.serve_forever.side_effect = check_angel
+
+        db_angel = tmp_path / 'test_angel.sqlite3'
+        main([
+            '--db', str(db_angel),
+            '--source', 'angel',
+            '--auto-start',
+            '--master', str(master_file),
+            '--calendar', str(calendar_file),
+            '--symbol', 'SBIN-EQ',
+            '--vix-symbol', 'INDIA_VIX',
+        ])
+        assert angel_state['running'] is True
+        assert angel_state['auto_enabled'] is True
+        assert angel_state['symbol'] == 'SBIN.NS'
+
+    # 4. With emergency stop latched: cannot auto-start even with TRADINGAGENTS_AUTO_START=1
+    monkeypatch.setenv('TRADINGAGENTS_AUTO_START', '1')
+    ledger = PaperLedger(db_path)
+    ledger.kill(True, '2026-09-17T10:00:00+05:30')
+    ledger.close()
+
+    with patch('tradingagents.runtime.__main__.DashboardServer') as mock_server_cls:
+        mock_instance = mock_server_cls.return_value
+        mock_instance.origin = 'http://127.0.0.1:8765'
+        latched_state = {}
+
+        def check_latched(*args, **kwargs):
+            svc = mock_server_cls.call_args[0][0]
+            latched_state['running'] = svc.running
+            raise KeyboardInterrupt()
+
+        mock_instance.serve_forever.side_effect = check_latched
+
+        main(['--db', str(db_path), '--source', 'demo'])
+        assert latched_state['running'] is False
+
+
+
 

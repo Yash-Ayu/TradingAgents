@@ -1145,9 +1145,18 @@ function initAI() {
   const openDialog = () => {
     if (dialog && typeof dialog.showModal === 'function') {
       $('ai-form-error').textContent = '';
+      if (appState && appState.ai && appState.ai.provider && providerSelect) {
+        providerSelect.value = appState.ai.provider;
+      } else if (providerSelect && (!providerSelect.value || providerSelect.value === 'openai')) {
+        providerSelect.value = 'google';
+      }
       const modelInput = $('ai-model');
-      if (modelInput && !modelInput.value) {
-        modelInput.value = 'gemini-3.6-flash';
+      if (modelInput) {
+        if (appState && appState.ai && appState.ai.model) {
+          modelInput.value = appState.ai.model;
+        } else if (!modelInput.value || modelInput.value === 'gemini-3.6-flash') {
+          modelInput.value = (providerSelect && providerSelect.value === 'google') ? 'gemini-3.6-flash' : 'gpt-4.1-mini';
+        }
       }
       dialog.showModal();
     }
@@ -1302,13 +1311,26 @@ function initActions() {
       }
 
       try {
-        const res = await fetch(`/api/${action}`, {
+        let url = `/api/${action}`;
+        let body = '{}';
+        if (action === 'start' && appState && appState.source === 'angel') {
+          url = '/api/auto/start';
+          let sym = appState.analysis_symbol;
+          if (!sym && appState.instrument && appState.instrument.symbol) {
+            sym = (appState.instrument.exchange === 'NSE' && appState.instrument.instrument_type === 'EQ')
+              ? appState.instrument.symbol.replace(/-EQ$/, '') + '.NS'
+              : appState.instrument.symbol;
+          }
+          if (!sym) sym = selectedSymbol || 'SBIN.NS';
+          body = JSON.stringify({ symbol: sym });
+        }
+        const res = await fetch(url, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'X-Control-Token': getControlToken()
           },
-          body: '{}'
+          body: body
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Control failed');
@@ -1448,7 +1470,11 @@ function render(s) {
   text('instrument', `${s.instrument?.exchange || 'NSE'} / ${s.instrument?.symbol || 'DEMO-EQ'}`);
   text('risk', s.risk?.risk_state || 'Waiting');
 
-  if ($('start')) $('start').disabled = isRunning || isKilled;
+  const startBtn = $('start');
+  if (startBtn) {
+    startBtn.disabled = isRunning || isKilled;
+    startBtn.textContent = s.source === 'angel' ? 'Start Paper Trading' : 'Start demo';
+  }
   if ($('stop')) $('stop').disabled = !isRunning;
   if ($('reset')) $('reset').hidden = !isKilled;
 
