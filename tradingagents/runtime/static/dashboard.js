@@ -1490,7 +1490,7 @@ function render(s) {
     }
     const analyzeBtn = $('analyze');
     if (analyzeBtn) {
-      analyzeBtn.disabled = isBusy || !s.ai.configured;
+      analyzeBtn.disabled = isBusy || (selectedSymbol === 'DEMO-EQ' || selectedSymbol === 'DEMO');
       if (isBusy) {
         analyzeBtn.innerHTML = 'Analyzing stock… <span style="display:inline-block;">⏳</span>';
       } else {
