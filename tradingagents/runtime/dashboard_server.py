@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
@@ -15,7 +16,6 @@ class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, service, host=None, port=8765):
-        import os
         self.service = service
         self.control_token = secrets.token_urlsafe(32)
         bind_host = host or os.environ.get('TRADINGAGENTS_HOST') or os.environ.get('HOST') or '127.0.0.1'
@@ -51,7 +51,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if bind_host in {'0.0.0.0', '::', ''}:
             return True
         port = str(self.server.server_port)
-        allowed = {f'127.0.0.1:{port}', f'localhost:{port}', f'{bind_host}:{port}', '127.0.0.1', 'localhost'}
+        allowed = {f'127.0.0.1:{port}', f'localhost:{port}', f'{bind_host}:{port}', '127.0.0.1', 'localhost', bind_host}
+        allowed_hosts_env = os.environ.get('TRADINGAGENTS_ALLOWED_HOSTS', '')
+        if allowed_hosts_env:
+            for h in allowed_hosts_env.split(','):
+                h = h.strip()
+                if h:
+                    allowed.add(h)
+                    allowed.add(f'{h}:{port}')
+                    allowed.add(f'{h}:80')
+                    allowed.add(f'{h}:443')
         return host_header in allowed
 
     def do_GET(self):
@@ -153,12 +162,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         host_header = self.headers.get('Host', '')
+        port = str(self.server.server_port)
         valid_origins = {
             None,
             self.server.origin,
             f"http://{host_header}",
             f"https://{host_header}",
+            f"http://{host_header}:{port}",
+            f"https://{host_header}:{port}",
         }
+        allowed_origins_env = os.environ.get('TRADINGAGENTS_ALLOWED_ORIGINS', '')
+        if allowed_origins_env:
+            for orig in allowed_origins_env.split(','):
+                orig = orig.strip()
+                if orig:
+                    valid_origins.add(orig)
+        allowed_hosts_env = os.environ.get('TRADINGAGENTS_ALLOWED_HOSTS', '')
+        if allowed_hosts_env:
+            for h in allowed_hosts_env.split(','):
+                h = h.strip()
+                if h:
+                    valid_origins.add(f"http://{h}")
+                    valid_origins.add(f"https://{h}")
+                    valid_origins.add(f"http://{h}:{port}")
+                    valid_origins.add(f"https://{h}:{port}")
         if (not self._valid_host()
                 or self.headers.get('Origin') not in valid_origins
                 or not secrets.compare_digest(self.headers.get('X-Control-Token', ''), self.server.control_token)):

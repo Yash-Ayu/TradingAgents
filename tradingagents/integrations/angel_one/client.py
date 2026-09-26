@@ -8,12 +8,20 @@ Order execution APIs (placeOrder, modifyOrder, cancelOrder) are strictly prohibi
 and will raise an exception if called.
 """
 
+from contextlib import suppress
 import logging
 import os
 from typing import Any, Dict, Optional
 
 import pyotp
 from SmartApi import SmartConnect
+
+with suppress(Exception):
+    import logzero
+    logzero.logger.setLevel(logging.WARNING)
+    logging.getLogger("smartapi").setLevel(logging.WARNING)
+    logging.getLogger("SmartApi").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 

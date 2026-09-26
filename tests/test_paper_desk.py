@@ -1,4 +1,4 @@
-﻿"""Full offline paper flow, persistence, data rejection and HTTP controls."""
+"""Full offline paper flow, persistence, data rejection and HTTP controls."""
 from __future__ import annotations
 
 import json
@@ -289,7 +289,7 @@ def test_angel_feed_normalizes_read_only_data_and_preserves_partial_status(clock
     assert 'SECRET' not in json.dumps(data)
 
 
-def test_http_ui_and_csrf_protected_controls(ledger, clock):
+def test_http_ui_and_csrf_protected_controls(ledger, clock, monkeypatch):
     service = PaperTradingService(DemoFeed(), ledger, clock=lambda: clock[0])
     server = DashboardServer(service, port=0)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -318,6 +318,17 @@ def test_http_ui_and_csrf_protected_controls(ledger, clock):
         with pytest.raises(HTTPError) as error:
             post('start', server.control_token)
         assert error.value.code == 409
+        # Reset kill switch for further testing
+        with post('reset', server.control_token) as response:
+            assert not json.load(response)['account']['kill_switch']
+        # Whitelisted public origin succeeds
+        monkeypatch.setenv('TRADINGAGENTS_ALLOWED_ORIGINS', 'http://139.59.89.238')
+        with post('start', server.control_token, 'http://139.59.89.238') as response:
+            assert json.load(response)['status'] == 'running'
+        # Untrusted origin is rejected with 403 Forbidden
+        with pytest.raises(HTTPError) as error:
+            post('stop', server.control_token, 'http://malicious.evil.com')
+        assert error.value.code == 403
     finally:
         service.stop()
         if service.thread:

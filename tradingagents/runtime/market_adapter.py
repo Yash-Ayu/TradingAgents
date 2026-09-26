@@ -25,6 +25,13 @@ from zoneinfo import ZoneInfo
 logger = logging.getLogger(__name__)
 IST = ZoneInfo('Asia/Kolkata')
 
+with suppress(Exception):
+    import logzero
+    logzero.logger.setLevel(logging.WARNING)
+    logging.getLogger("smartapi").setLevel(logging.WARNING)
+    logging.getLogger("SmartApi").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
 # Built-in fast token lookup for top Indian benchmark indices and high-liquidity stocks
 WELL_KNOWN_TOKENS = {
     'NIFTY': ('NSE', '99926000', 'NIFTY 50'),
