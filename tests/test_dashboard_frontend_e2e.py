@@ -12,8 +12,7 @@ Verifies all user-reported frontend interactions:
 from __future__ import annotations
 
 import threading
-import time
-from pathlib import Path
+
 import pytest
 from playwright.sync_api import sync_playwright
 
@@ -49,7 +48,10 @@ def test_dashboard_frontend_full_e2e(running_dashboard):
     server_url = running_dashboard.origin
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+        )
         page = browser.new_page(viewport={"width": 1440, "height": 900})
 
         page.on("pageerror", lambda err: errors.append(f"PageError: {err}"))
