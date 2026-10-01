@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .market_adapter import get_active_market_adapter, search_instruments
 from .market_view import research_chart
+from .rate_limiter import AngelBucket, get_angel_rate_limiter
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -115,9 +116,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if adapter.name == 'angel_one':
                 try:
                     client = adapter._get_client()
+                    limiter = get_angel_rate_limiter()
+                    limiter.acquire(AngelBucket.ACCOUNT)
                     profile = client.get_profile()
+                    limiter.acquire(AngelBucket.ACCOUNT)
                     rms = client._smart_connect.rmsLimit()
+                    limiter.acquire(AngelBucket.ACCOUNT)
                     pos = client._smart_connect.position()
+                    limiter.acquire(AngelBucket.ACCOUNT)
                     orders = client._smart_connect.orderBook()
                     rms_data = rms.get('data', {}) if rms and rms.get('status') else {}
                     self._send(200, {
@@ -145,6 +151,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         if req_path == '/api/status':
             self._send(200, self.server.service.status())
+            return
+
+        if req_path == '/api/scanner/status':
+            service = self.server.service
+            status_data = {
+                'scanner': getattr(service, 'last_scanner_result', {}),
+                'btst': getattr(service, 'last_btst_result', {}),
+                'fo_positions': [p.model_dump() for p in service.fo_orchestrator.paper_engine.get_open_positions()] if hasattr(service, 'fo_orchestrator') else [],
+                'fo_orders': service.fo_orchestrator.paper_engine.get_orders(20) if hasattr(service, 'fo_orchestrator') else [],
+                'fo_history': service.fo_orchestrator.paper_engine.get_trade_history(20) if hasattr(service, 'fo_orchestrator') else [],
+                'fo_metrics': service.fo_orchestrator.paper_engine.get_performance_metrics().model_dump() if hasattr(service, 'fo_orchestrator') else {},
+            }
+            self._send(200, status_data)
             return
 
         assets = {'/': ('dashboard.html', 'text/html; charset=utf-8'),

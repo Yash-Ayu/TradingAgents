@@ -107,6 +107,8 @@ class PaperOrder(BaseModel):
     target: Optional[float] = None
     data_source: str = "LIVE_ANGEL_ONE"
     reason: Optional[str] = None
+    trade_type: str = "INTRADAY"
+    strategy_id: str = "DEFAULT"
 
 
 class PaperPosition(BaseModel):
@@ -127,6 +129,8 @@ class PaperPosition(BaseModel):
     closed_at: Optional[datetime] = None
     data_source: str = "LIVE_ANGEL_ONE"
     is_unknown_data: bool = False
+    trade_type: str = "INTRADAY"
+    strategy_id: str = "DEFAULT"
 
 
 class PaperAccountStats(BaseModel):
@@ -200,7 +204,9 @@ class FOPaperTradingEngine:
                     charges REAL NOT NULL,
                     status TEXT NOT NULL,
                     reason TEXT,
-                    data_source TEXT DEFAULT 'LIVE_ANGEL_ONE'
+                    data_source TEXT DEFAULT 'LIVE_ANGEL_ONE',
+                    trade_type TEXT DEFAULT 'INTRADAY',
+                    strategy_id TEXT DEFAULT 'DEFAULT'
                 );
 
                 CREATE TABLE IF NOT EXISTS paper_positions (
@@ -218,7 +224,9 @@ class FOPaperTradingEngine:
                     lowest_price REAL NOT NULL,
                     opened_at TEXT NOT NULL,
                     data_source TEXT DEFAULT 'LIVE_ANGEL_ONE',
-                    is_unknown_data INTEGER DEFAULT 0
+                    is_unknown_data INTEGER DEFAULT 0,
+                    trade_type TEXT DEFAULT 'INTRADAY',
+                    strategy_id TEXT DEFAULT 'DEFAULT'
                 );
 
                 CREATE TABLE IF NOT EXISTS paper_trade_history (
@@ -234,10 +242,20 @@ class FOPaperTradingEngine:
                     entry_time TEXT NOT NULL,
                     exit_time TEXT NOT NULL,
                     exit_reason TEXT NOT NULL,
-                    data_source TEXT DEFAULT 'LIVE_ANGEL_ONE'
+                    data_source TEXT DEFAULT 'LIVE_ANGEL_ONE',
+                    trade_type TEXT DEFAULT 'INTRADAY',
+                    strategy_id TEXT DEFAULT 'DEFAULT'
                 );
                 """
             )
+
+            # Migrate schema if columns are missing in pre-existing database
+            for tbl in ("paper_orders", "paper_positions", "paper_trade_history"):
+                for col, default_val in [("trade_type", "'INTRADAY'"), ("strategy_id", "'DEFAULT'")]:
+                    try:
+                        self.conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} TEXT DEFAULT {default_val}")
+                    except sqlite3.OperationalError:
+                        pass
 
             # Initialize account state if not present
             defaults = {
@@ -269,6 +287,8 @@ class FOPaperTradingEngine:
         idempotency_key: Optional[str] = None,
         slippage_pct: float = 0.5,
         data_source: str = "LIVE_ANGEL_ONE",
+        trade_type: str = "INTRADAY",
+        strategy_id: str = "DEFAULT",
     ) -> PaperOrder:
         """
         Simulate order execution with slippage and charges.
@@ -302,6 +322,8 @@ class FOPaperTradingEngine:
                     timestamp=datetime.now(),
                     data_source=data_source,
                     reason="DUPLICATE_ORDER_IDEMPOTENT_BLOCK",
+                    trade_type=trade_type,
+                    strategy_id=strategy_id,
                 )
 
             # 2. SLIPPAGE CALCULATION
@@ -340,10 +362,12 @@ class FOPaperTradingEngine:
                     timestamp=datetime.now(),
                     data_source=data_source,
                     reason="INSUFFICIENT_FUNDS",
+                    trade_type=trade_type,
+                    strategy_id=strategy_id,
                 )
                 self.conn.execute(
                     """
-                    INSERT INTO paper_orders VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    INSERT INTO paper_orders VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         rej_order.order_id,
@@ -360,6 +384,8 @@ class FOPaperTradingEngine:
                         "REJECTED",
                         "INSUFFICIENT_FUNDS",
                         data_source,
+                        trade_type,
+                        strategy_id,
                     ),
                 )
                 return rej_order
@@ -385,12 +411,14 @@ class FOPaperTradingEngine:
                 target=target,
                 data_source=data_source,
                 reason="SUCCESS",
+                trade_type=trade_type,
+                strategy_id=strategy_id,
             )
 
             # Record in orders table
             self.conn.execute(
                 """
-                INSERT INTO paper_orders VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO paper_orders VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     order.order_id,
@@ -407,6 +435,8 @@ class FOPaperTradingEngine:
                     "FILLED",
                     "SUCCESS",
                     data_source,
+                    trade_type,
+                    strategy_id,
                 ),
             )
 
@@ -414,7 +444,7 @@ class FOPaperTradingEngine:
             if act_upper == "BUY":
                 self.conn.execute(
                     """
-                    INSERT INTO paper_positions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    INSERT INTO paper_positions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         symbol,
@@ -432,9 +462,11 @@ class FOPaperTradingEngine:
                         order.timestamp.isoformat(),
                         data_source,
                         0,
+                        trade_type,
+                        strategy_id,
                     ),
                 )
-                logger.info(f"[PAPER FILL] BUY {lots} lots ({quantity} qty) of {symbol} @ ₹{fill_price:.2f} (Charges: ₹{total_charges:.2f}, Source: {data_source})")
+                logger.info(f"[PAPER FILL] BUY {lots} lots ({quantity} qty) of {symbol} @ ₹{fill_price:.2f} (Trade: {trade_type} | Strategy: {strategy_id} | Charges: ₹{total_charges:.2f}, Source: {data_source})")
 
             return order
 
@@ -487,7 +519,9 @@ class FOPaperTradingEngine:
 
             triggered_exit = None
             if stop_loss and ltp <= stop_loss:
-                logger.warning(f"[AUTO STOP-LOSS TRIGGER] {symbol}: LTP ₹{ltp:.2f} <= SL ₹{stop_loss:.2f}")
+                if ltp < stop_loss:
+                    gap_slippage = round(stop_loss - ltp, 2)
+                    logger.warning(f"[OVERNIGHT GAP RISK SL JUMP] {symbol}: Filled at market open LTP ₹{ltp:.2f} vs planned SL ₹{stop_loss:.2f} (Gap: ₹{gap_slippage:.2f})")
                 self.close_position(symbol=symbol, exit_price=ltp, reason="STOP_LOSS_HIT")
                 triggered_exit = "STOP_LOSS_HIT"
             elif target and ltp >= target:
@@ -524,6 +558,8 @@ class FOPaperTradingEngine:
             entry_time = row["opened_at"]
             entry_charges = row["total_charges"]
             data_source = row["data_source"] if "data_source" in row.keys() else "LIVE_ANGEL_ONE"
+            trade_type = row["trade_type"] if "trade_type" in row.keys() else "INTRADAY"
+            strategy_id = row["strategy_id"] if "strategy_id" in row.keys() else "DEFAULT"
 
             # Slippage on exit (SELL)
             slippage_amount = round(exit_price * (slippage_pct / 100.0), 2)
@@ -554,8 +590,8 @@ class FOPaperTradingEngine:
             now_iso = datetime.now().isoformat()
             self.conn.execute(
                 """
-                INSERT INTO paper_trade_history (symbol, entry_price, exit_price, quantity, lots, gross_pnl, charges, net_pnl, entry_time, exit_time, exit_reason, data_source)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO paper_trade_history (symbol, entry_price, exit_price, quantity, lots, gross_pnl, charges, net_pnl, entry_time, exit_time, exit_reason, data_source, trade_type, strategy_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     symbol,
@@ -570,6 +606,8 @@ class FOPaperTradingEngine:
                     now_iso,
                     reason,
                     data_source,
+                    trade_type,
+                    strategy_id,
                 ),
             )
 
@@ -590,7 +628,7 @@ class FOPaperTradingEngine:
             idemp_key = f"EXIT_{uuid4().hex}"
             self.conn.execute(
                 """
-                INSERT INTO paper_orders VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO paper_orders VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     order_id,
@@ -607,11 +645,13 @@ class FOPaperTradingEngine:
                     "FILLED",
                     reason,
                     data_source,
+                    trade_type,
+                    strategy_id,
                 ),
             )
 
             logger.info(
-                f"[PAPER CLOSE] {symbol} @ ₹{fill_price:.2f} | Gross: ₹{gross_pnl:.2f} | Charges: ₹{total_trade_charges:.2f} | Net: ₹{net_pnl:.2f} ({reason}, Source: {data_source})"
+                f"[PAPER CLOSE] {symbol} @ ₹{fill_price:.2f} | Trade: {trade_type} | Strategy: {strategy_id} | Gross: ₹{gross_pnl:.2f} | Charges: ₹{total_trade_charges:.2f} | Net: ₹{net_pnl:.2f} ({reason}, Source: {data_source})"
             )
 
             return PaperOrder(
@@ -629,6 +669,8 @@ class FOPaperTradingEngine:
                 timestamp=datetime.now(),
                 data_source=data_source,
                 reason=reason,
+                trade_type=trade_type,
+                strategy_id=strategy_id,
             )
 
     def get_open_positions(self) -> List[PaperPosition]:
@@ -640,6 +682,8 @@ class FOPaperTradingEngine:
                 contract = ContractSpec(**json.loads(r["contract_json"]))
                 data_source = r["data_source"] if "data_source" in r.keys() else "LIVE_ANGEL_ONE"
                 is_unknown = bool(r["is_unknown_data"]) if "is_unknown_data" in r.keys() else False
+                trade_type = r["trade_type"] if "trade_type" in r.keys() else "INTRADAY"
+                strategy_id = r["strategy_id"] if "strategy_id" in r.keys() else "DEFAULT"
                 positions.append(
                     PaperPosition(
                         symbol=r["symbol"],
@@ -657,6 +701,8 @@ class FOPaperTradingEngine:
                         opened_at=datetime.fromisoformat(r["opened_at"]),
                         data_source=data_source,
                         is_unknown_data=is_unknown,
+                        trade_type=trade_type,
+                        strategy_id=strategy_id,
                     )
                 )
             return positions
@@ -723,3 +769,14 @@ class FOPaperTradingEngine:
                 sim_trades_count=sim_trades,
             )
 
+    def get_trade_history(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Fetch closed paper trades history."""
+        with self.lock:
+            rows = self.conn.execute("SELECT * FROM paper_trade_history ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_orders(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Fetch all submitted paper orders."""
+        with self.lock:
+            rows = self.conn.execute("SELECT * FROM paper_orders ORDER BY rowid DESC LIMIT ?", (limit,)).fetchall()
+            return [dict(r) for r in rows]

@@ -56,8 +56,11 @@ class ScripMasterManager:
 
     def download_scrip_master(self, force: bool = False) -> Path:
         """Download latest Scrip Master JSON if cache is missing, stale, or force=True."""
-        if not force and self.is_cache_fresh():
-            logger.info("Scrip master cache is fresh (modified today). Skipping download.")
+        if not force and self.cache_file.exists():
+            if self.is_cache_fresh():
+                logger.info("Scrip master cache is fresh (modified today). Skipping download.")
+            else:
+                logger.info("Scrip master cache exists on disk. Using cached file (pass force=True to re-download).")
             return self.cache_file
 
         logger.info(f"Downloading Scrip Master from {SCRIP_MASTER_URL} ...")
@@ -227,19 +230,39 @@ class ScripMasterManager:
         sorted_dates = sorted(expiries_map.keys())
         return [expiries_map[d] for d in sorted_dates]
 
+    def _infer_instrument_type(self, underlying: str, exchange: str, default: str = "OPTIDX") -> str:
+        """Infer whether underlying is an index or stock derivative based on indexed series."""
+        u_upper = underlying.upper().strip()
+        e_upper = exchange.upper().strip()
+        if (e_upper, u_upper, default.upper()) in self._index_by_series:
+            return default.upper()
+        # Alternate fallback
+        alt_map = {
+            "OPTIDX": "OPTSTK",
+            "OPTSTK": "OPTIDX",
+            "FUTIDX": "FUTSTK",
+            "FUTSTK": "FUTIDX",
+        }
+        alt = alt_map.get(default.upper(), default.upper())
+        if (e_upper, u_upper, alt) in self._index_by_series:
+            return alt
+        return default.upper()
+
     def get_available_strikes(
         self,
         underlying: str,
         exchange: str,
         expiry: str,
         option_type: Optional[str] = None,
+        instrument_type: Optional[str] = None,
     ) -> List[float]:
         """
         Dynamically discover available strikes from Scrip Master for a given expiry.
-        Does NOT rely on hardcoded strike steps.
+        Supports both Index Options (OPTIDX) and Stock Options (OPTSTK).
         """
         self.ensure_loaded()
-        key = (exchange.upper(), underlying.upper(), "OPTIDX")
+        itype = instrument_type or self._infer_instrument_type(underlying, exchange, "OPTIDX")
+        key = (exchange.upper(), underlying.upper(), itype.upper())
         records = self._index_by_series.get(key, [])
 
         target_parsed = self.parse_expiry_date(expiry)
@@ -268,10 +291,12 @@ class ScripMasterManager:
         expiry: str,
         strike: float,
         option_type: str,
+        instrument_type: Optional[str] = None,
     ) -> Optional[InstrumentRecord]:
-        """Find the exact option contract matching parameters."""
+        """Find the exact option contract matching parameters for OPTIDX or OPTSTK."""
         self.ensure_loaded()
-        key = (exchange.upper(), underlying.upper(), "OPTIDX")
+        itype = instrument_type or self._infer_instrument_type(underlying, exchange, "OPTIDX")
+        key = (exchange.upper(), underlying.upper(), itype.upper())
         records = self._index_by_series.get(key, [])
 
         target_parsed = self.parse_expiry_date(expiry)
@@ -294,10 +319,12 @@ class ScripMasterManager:
         underlying: str,
         exchange: str,
         expiry: str,
+        instrument_type: Optional[str] = None,
     ) -> Optional[InstrumentRecord]:
-        """Find the exact futures contract matching parameters."""
+        """Find the exact futures contract matching parameters for FUTIDX or FUTSTK."""
         self.ensure_loaded()
-        key = (exchange.upper(), underlying.upper(), "FUTIDX")
+        itype = instrument_type or self._infer_instrument_type(underlying, exchange, "FUTIDX")
+        key = (exchange.upper(), underlying.upper(), itype.upper())
         records = self._index_by_series.get(key, [])
 
         target_parsed = self.parse_expiry_date(expiry)
@@ -309,4 +336,40 @@ class ScripMasterManager:
                 return rec
 
         return None
+
+    def get_fo_universe(self, exchange: str = "NFO") -> Dict[str, Dict[str, Any]]:
+        """
+        Dynamically returns all tradable F&O underlyings for an exchange.
+        Categorized by indices (OPTIDX/FUTIDX) and stocks (OPTSTK/FUTSTK).
+        Includes underlying name, instrument types, lot size, and available expiries.
+        """
+        self.ensure_loaded()
+        exch = exchange.upper()
+        universe: Dict[str, Dict[str, Any]] = {}
+        for (e, name, itype), records in self._index_by_series.items():
+            if e != exch:
+                continue
+            if itype not in {"OPTIDX", "FUTIDX", "OPTSTK", "FUTSTK"}:
+                continue
+            if name not in universe:
+                universe[name] = {
+                    "underlying": name,
+                    "exchange": e,
+                    "is_index": itype in {"OPTIDX", "FUTIDX"},
+                    "instrument_types": set(),
+                    "lot_size": records[0].lotsize if records else 1,
+                    "expiries": set(),
+                }
+            universe[name]["instrument_types"].add(itype)
+            for r in records:
+                if r.expiry:
+                    universe[name]["expiries"].add(r.expiry)
+
+        for item in universe.values():
+            item["instrument_types"] = sorted(list(item["instrument_types"]))
+            item["expiries"] = sorted(
+                list(item["expiries"]), key=lambda x: self.parse_expiry_date(x) or date.max
+            )
+        return universe
+
 

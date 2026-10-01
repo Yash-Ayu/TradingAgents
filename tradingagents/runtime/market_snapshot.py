@@ -61,6 +61,14 @@ class Instrument:
     def key(self):
         return f'{self.exchange}:{self.token}'
 
+    def validate_reference(self, now: datetime):
+        if self.instrument_type not in {'INDEX', 'EQ', 'FUTIDX', 'FUTSTK', 'OPTIDX', 'OPTSTK'}:
+            raise ValueError('non_tradable_instrument')
+        if self.exchange in {'NFO', 'BFO'} and not self.expiry:
+            raise ValueError('expiry_required')
+        if self.expiry and date.fromisoformat(self.expiry) < timestamp(now).date():
+            raise ValueError('expired_instrument')
+
     def validate_trade(self, now: datetime):
         if self.instrument_type not in {'EQ', 'FUTIDX', 'FUTSTK', 'OPTIDX', 'OPTSTK'}:
             raise ValueError('non_tradable_instrument')
@@ -91,7 +99,15 @@ class InstrumentResolver:
                 expiry = datetime.strptime(expiry, '%d%b%Y').date().isoformat()
             except ValueError:
                 expiry = date.fromisoformat(expiry).isoformat()
-        kind = row.get('instrumenttype') or ('EQ' if symbol.endswith('-EQ') else 'INDEX')
+        raw_type = str(row.get('instrumenttype') or '').strip().upper()
+        if raw_type == 'AMXIDX':
+            kind = 'INDEX'
+        elif raw_type in {'INDEX', 'EQ', 'FUTIDX', 'FUTSTK', 'OPTIDX', 'OPTSTK'}:
+            kind = raw_type
+        elif not raw_type:
+            kind = 'EQ' if symbol.endswith('-EQ') else 'INDEX'
+        else:
+            kind = raw_type
         return Instrument(exchange, symbol, str(row['token']), int(row['lotsize']), kind, expiry)
 
 

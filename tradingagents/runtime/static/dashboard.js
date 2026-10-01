@@ -1373,12 +1373,19 @@ function renderPositionsTable(positions) {
     const row = document.createElement('tr');
     const pnl = Number(p.unrealized_pnl) || 0;
     const pnlClass = pnl >= 0 ? 'positive' : 'negative';
+    const isBtst = (p.trade_type === 'BTST' || (p.strategy_id && p.strategy_id.startsWith('BTST')));
+    const badgeHtml = isBtst 
+      ? ` <span class="badge badge-btst">[BTST]</span>`
+      : (p.trade_type ? ` <span class="badge badge-intraday">[INTRADAY]</span>` : '');
+    const sym = p.symbol || p.instrument || '—';
+    const avg = p.average_price !== undefined ? p.average_price : (p.average !== undefined ? p.average : 0);
+    const mark = p.current_mark !== undefined ? p.current_mark : (p.mark !== undefined ? p.mark : 0);
 
     row.innerHTML = `
-      <td><strong>${p.symbol || '—'}</strong></td>
+      <td><strong>${sym}</strong>${badgeHtml}${p.strategy_id ? `<br><small class="muted" style="font-size:8.5px;">${p.strategy_id}</small>` : ''}</td>
       <td>${p.qty || 0}</td>
-      <td>${money(p.average)}</td>
-      <td>${money(p.mark)}</td>
+      <td>${money(avg)}</td>
+      <td>${money(mark)}</td>
       <td class="${pnlClass}"><strong>${money(pnl)}</strong></td>
     `;
     return row;
@@ -1399,10 +1406,14 @@ function renderOrdersTable(orders) {
     const side = (o.side || 'BUY').toUpperCase();
     const sideClass = side === 'BUY' ? 'positive' : 'negative';
     const timeStr = o.timestamp ? new Date(o.timestamp).toLocaleTimeString() : '—';
+    const isBtst = (o.trade_type === 'BTST' || (o.strategy_id && o.strategy_id.startsWith('BTST')));
+    const badgeHtml = isBtst 
+      ? ` <span class="badge badge-btst">[BTST]</span>`
+      : (o.trade_type ? ` <span class="badge badge-intraday">[INTRADAY]</span>` : '');
 
     row.innerHTML = `
       <td>${timeStr}</td>
-      <td><strong>${o.symbol || '—'}</strong></td>
+      <td><strong>${o.symbol || '—'}</strong>${badgeHtml}${o.strategy_id ? `<br><small class="muted" style="font-size:8.5px;">${o.strategy_id}</small>` : ''}</td>
       <td><strong class="${sideClass}">${side}</strong></td>
       <td>${o.qty || 0}</td>
       <td>${money(o.price)}</td>
@@ -1438,14 +1449,14 @@ function render(s) {
   text('drawdown', `Drawdown ${(s.account?.drawdown_pct || 0).toFixed(2)}%`);
 
   // 3. Tab Badge Counts (Just the numbers)
-  const posCount = s.account?.positions ? s.account.positions.length : 0;
-  const ordCount = s.orders ? s.orders.length : 0;
-  text('position-count', posCount);
-  text('order-count', ordCount);
+  const allPositions = [...(s.fo_positions || []), ...(s.account?.positions || [])];
+  const allOrders = [...(s.fo_orders || []), ...(s.orders || [])];
+  text('position-count', allPositions.length);
+  text('order-count', allOrders.length);
 
   // 4. Tables
-  renderPositionsTable(s.account?.positions || []);
-  renderOrdersTable(s.orders || []);
+  renderPositionsTable(allPositions);
+  renderOrdersTable(allOrders);
 
   // 5. Funds Summary
   const fundsSummary = $('funds-summary');
@@ -1489,6 +1500,8 @@ function render(s) {
     ['VIX', s.snapshot?.vix?.toFixed(2) || '—'],
     ['ATR ratio', s.snapshot?.atr_ratio?.toFixed(3) || '—'],
     ['Trend strength', s.snapshot?.trend_strength?.toFixed(3) || '—'],
+    ['BTST Window', s.btst?.window_active ? 'ACTIVE (14:45 - 15:15 IST)' : (s.btst?.window_status || 'CLOSED')],
+    ['F&O Scanner', s.fo_scanner ? `${s.fo_scanner.scanned_count || 0} symbols monitored` : 'Active'],
     ['Trading gate', s.allow_trade ? 'Eligible for trade checks' : 'Blocked / Monitoring']
   ]);
 

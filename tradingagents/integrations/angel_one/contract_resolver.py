@@ -100,7 +100,7 @@ class FOContractResolver:
                 )
 
         # 3. Instrument-Specific Resolution
-        if request.instrument_type == DerivativeType.OPTIDX:
+        if request.instrument_type in (DerivativeType.OPTIDX, DerivativeType.OPTSTK):
             return self._resolve_option(
                 request=request,
                 underlying=underlying,
@@ -108,11 +108,12 @@ class FOContractResolver:
                 expiry=selected_expiry,
                 spot_price=spot_price,
             )
-        elif request.instrument_type == DerivativeType.FUTIDX:
+        elif request.instrument_type in (DerivativeType.FUTIDX, DerivativeType.FUTSTK):
             return self._resolve_future(
                 underlying=underlying,
                 exchange=exchange,
                 expiry=selected_expiry,
+                instrument_type=request.instrument_type,
             )
         else:
             return ResolutionResult(
@@ -128,7 +129,7 @@ class FOContractResolver:
         expiry: str,
         spot_price: float,
     ) -> ResolutionResult:
-        """Resolve an index option contract."""
+        """Resolve an index or stock option contract."""
         # Validate Market Bias
         if request.bias == MarketBias.NEUTRAL:
             return ResolutionResult(
@@ -145,6 +146,7 @@ class FOContractResolver:
             exchange=exchange.value,
             expiry=expiry,
             option_type=option_type.value,
+            instrument_type=request.instrument_type.value,
         )
 
         if not available_strikes:
@@ -192,6 +194,7 @@ class FOContractResolver:
             expiry=expiry,
             strike=target_strike,
             option_type=option_type.value,
+            instrument_type=request.instrument_type.value,
         )
 
         if contract_rec is None:
@@ -220,7 +223,7 @@ class FOContractResolver:
             exchange=exchange,
             trading_symbol=contract_rec.symbol,
             symbol_token=contract_rec.token,
-            instrument_type=DerivativeType.OPTIDX,
+            instrument_type=request.instrument_type,
             option_type=option_type,
             strike_price=target_strike,
             expiry_date=expiry,
@@ -240,12 +243,15 @@ class FOContractResolver:
         underlying: str,
         exchange: Exchange,
         expiry: str,
+        instrument_type: Optional[DerivativeType] = None,
     ) -> ResolutionResult:
-        """Resolve an index futures contract."""
+        """Resolve an index or stock futures contract."""
+        inst_type = instrument_type or DerivativeType.FUTIDX
         contract_rec = self.scrip_master.find_future_contract(
             underlying=underlying,
             exchange=exchange.value,
             expiry=expiry,
+            instrument_type=inst_type.value,
         )
 
         if contract_rec is None:
@@ -272,7 +278,7 @@ class FOContractResolver:
             exchange=exchange,
             trading_symbol=contract_rec.symbol,
             symbol_token=contract_rec.token,
-            instrument_type=DerivativeType.FUTIDX,
+            instrument_type=inst_type,
             expiry_date=expiry,
             lot_size=contract_rec.lotsize,
             tick_size=contract_rec.tick_size,

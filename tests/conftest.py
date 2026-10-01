@@ -65,3 +65,18 @@ def mock_llm_client():
         return_value=client,
     ):
         yield client
+
+
+@pytest.fixture(autouse=True)
+def _isolate_rate_limiter():
+    """Reset the global Angel rate limiter before and after each test.
+
+    Prevents rate limiter cooldown state or throttling timestamps from leaking
+    between tests.
+    """
+    from tradingagents.runtime.rate_limiter import set_angel_rate_limiter
+
+    set_angel_rate_limiter(None)
+    yield
+    set_angel_rate_limiter(None)
+

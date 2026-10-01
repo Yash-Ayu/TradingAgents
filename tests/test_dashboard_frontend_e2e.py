@@ -11,15 +11,78 @@ Verifies all user-reported frontend interactions:
 
 from __future__ import annotations
 
+import math
 import threading
+from datetime import datetime, timedelta
+from typing import Any
+from unittest.mock import patch
 
 import pytest
 from playwright.sync_api import sync_playwright
 
 from tradingagents.runtime.angel_data import DemoFeed
 from tradingagents.runtime.dashboard_server import DashboardServer
+from tradingagents.runtime.market_snapshot import IST
 from tradingagents.runtime.paper_ledger import PaperLedger
 from tradingagents.runtime.paper_service import PaperTradingService
+
+
+class OfflineTestMarketAdapter:
+    """100% offline deterministic market adapter for E2E frontend tests.
+
+    Completely decouples browser E2E tests from Angel One and Yahoo Finance APIs,
+    guaranteeing zero external network calls, zero rate-limiting, and 100% deterministic latency.
+    """
+
+    name = "offline_test"
+
+    def __init__(self):
+        self.candle_calls = 0
+        self.quote_calls = 0
+
+    def is_configured(self) -> bool:
+        return True
+
+    def get_candles(self, symbol: str, interval: str = "5m") -> dict[str, Any]:
+        self.candle_calls += 1
+        now = datetime(2026, 9, 29, 15, 30, 0, tzinfo=IST)
+        minute = now.replace(second=0, microsecond=0)
+        step_map = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "1d": 1440}
+        step_minutes = step_map.get(interval, 5)
+        count = 60
+        rows = []
+        base_price = 500.0 if "SBIN" in symbol else (2500.0 if "RELIANCE" in symbol else 100.0)
+        for i in range(count):
+            stamp = minute - timedelta(minutes=(count - i) * step_minutes)
+            wave = math.sin(i * 0.3) * 1.5 + (i * 0.08)
+            o = round(base_price + wave, 2)
+            c = round(base_price + wave + (0.35 if (i % 3 != 0) else -0.4), 2)
+            h = round(max(o, c) + 0.25, 2)
+            low_p = round(min(o, c) - 0.20, 2)
+            v = int(1200 + (i % 7) * 180 + abs(math.sin(i)) * 400)
+            rows.append([stamp.isoformat(), o, h, low_p, c, v])
+        return {
+            "symbol": symbol,
+            "source": "OFFLINE_TEST_ADAPTER",
+            "interval": interval,
+            "chart": rows,
+            "price": rows[-1][4],
+            "timestamp": rows[-1][0],
+            "change_pct": round((rows[-1][4] / rows[0][1] - 1) * 100, 2),
+            "is_market_open": False,
+            "market_status": "CLOSED",
+        }
+
+    def get_quote(self, symbol: str) -> dict[str, Any]:
+        self.quote_calls += 1
+        candles = self.get_candles(symbol, interval="5m")
+        return {
+            "symbol": symbol,
+            "ltp": candles["price"],
+            "source": "OFFLINE_TEST_ADAPTER",
+            "timestamp": candles["timestamp"],
+            "is_market_open": False,
+        }
 
 
 @pytest.fixture(scope="module")
@@ -28,19 +91,35 @@ def running_dashboard(tmp_path_factory):
     ledger = PaperLedger(tmp_path / "test_desk.sqlite3", initial_cash=100000)
     feed = DemoFeed()
     service = PaperTradingService(feed, ledger)
+    fake_adapter = OfflineTestMarketAdapter()
+
+    patcher_adapter = patch("tradingagents.runtime.dashboard_server.get_active_market_adapter", return_value=fake_adapter)
+
+    def forbidden_research_chart(*args, **kwargs):
+        raise AssertionError("research_chart external network access forbidden during frontend E2E tests")
+
+    patcher_research = patch("tradingagents.runtime.dashboard_server.research_chart", side_effect=forbidden_research_chart)
+
+    patcher_adapter.start()
+    patcher_research.start()
+
     server = DashboardServer(service, port=0)
+    server.test_adapter = fake_adapter
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
-    yield server
-
-    service.stop()
-    if service.thread:
-        service.thread.join(timeout=2)
-    server.shutdown()
-    server.server_close()
-    thread.join(timeout=2)
-    ledger.close()
+    try:
+        yield server
+    finally:
+        service.stop()
+        if service.thread:
+            service.thread.join(timeout=2)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        ledger.close()
+        patcher_research.stop()
+        patcher_adapter.stop()
 
 
 def test_dashboard_frontend_full_e2e(running_dashboard):
@@ -299,6 +378,7 @@ def test_dashboard_frontend_full_e2e(running_dashboard):
         browser.close()
 
     assert not errors, f"Browser Console Errors occurred: {errors}"
+    assert running_dashboard.test_adapter.candle_calls > 0, "Expected fake adapter to service chart calls"
 
 
 @pytest.mark.parametrize(
@@ -372,3 +452,10 @@ def test_mobile_responsive_viewports(running_dashboard, width, height, device_na
         browser.close()
 
     assert not errors, f"Browser errors occurred at {width}px ({device_name}): {errors}"
+
+
+def test_e2e_isolation_blocks_external_network(running_dashboard):
+    """Verifies that the dashboard under test routes market requests through OfflineTestMarketAdapter
+    and never calls real Angel One or Yahoo network endpoints."""
+    assert running_dashboard.test_adapter.candle_calls > 0
+    assert running_dashboard.test_adapter.name == "offline_test"

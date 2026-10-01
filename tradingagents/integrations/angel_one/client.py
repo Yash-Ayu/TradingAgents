@@ -16,6 +16,9 @@ from typing import Any, Dict, Optional
 import pyotp
 from SmartApi import SmartConnect
 
+from tradingagents.runtime.rate_limiter import AngelBucket, get_angel_rate_limiter
+from tradingagents.runtime.security import is_rate_limit
+
 with suppress(Exception):
     import logzero
     logzero.logger.setLevel(logging.WARNING)
@@ -88,10 +91,14 @@ class AngelOneClient:
 
         try:
             logger.info(f"Initiating authentication for client: {redact_secret(self.client_code)}...")
-            self._smart_connect = SmartConnect(api_key=self.api_key)
+            if self._smart_connect is None:
+                self._smart_connect = SmartConnect(api_key=self.api_key)
 
             # Generate TOTP
             totp = pyotp.TOTP(self.totp_secret).now()
+
+            # Proactively throttle authentication requests through centralized limiter
+            get_angel_rate_limiter().acquire(AngelBucket.AUTH)
 
             # Generate Session
             session_data = self._smart_connect.generateSession(
@@ -99,6 +106,11 @@ class AngelOneClient:
                 password=self.pin,
                 totp=totp,
             )
+            if is_rate_limit(session_data):
+                logger.warning(
+                    "Angel rate limit: action=generateSession bucket=auth source=broker_response attempt=1"
+                )
+                get_angel_rate_limiter().notify_rate_limit()
 
             if not session_data or not session_data.get("status"):
                 err_msg = session_data.get("message", "Authentication failed without error message.")
@@ -124,6 +136,11 @@ class AngelOneClient:
             }
 
         except Exception as e:
+            if is_rate_limit(e):
+                logger.warning(
+                    "Angel rate limit: action=generateSession bucket=auth source=broker_exception attempt=1"
+                )
+                get_angel_rate_limiter().notify_rate_limit()
             logger.error(f"Exception during Angel One authentication: {type(e).__name__}")
             self._is_authenticated = False
             return {"status": False, "message": str(e), "error_code": "EXCEPTION"}
@@ -134,7 +151,13 @@ class AngelOneClient:
             return {"status": False, "message": "Not authenticated. Call authenticate() first."}
 
         try:
+            get_angel_rate_limiter().acquire(AngelBucket.ACCOUNT)
             profile = self._smart_connect.getProfile(self._refresh_token)
+            if is_rate_limit(profile):
+                logger.warning(
+                    "Angel rate limit: action=getProfile bucket=account source=broker_response attempt=1"
+                )
+                get_angel_rate_limiter().notify_rate_limit()
             if profile and profile.get("status"):
                 data = profile.get("data", {})
                 # Mask sensitive fields
@@ -148,6 +171,11 @@ class AngelOneClient:
                 return {"status": True, "data": safe_data}
             return profile
         except Exception as e:
+            if is_rate_limit(e):
+                logger.warning(
+                    "Angel rate limit: action=getProfile bucket=account source=broker_exception attempt=1"
+                )
+                get_angel_rate_limiter().notify_rate_limit()
             return {"status": False, "message": f"Failed to fetch profile: {e}"}
 
     def get_rms(self) -> Dict[str, Any]:
@@ -156,9 +184,20 @@ class AngelOneClient:
             return {"status": False, "message": "Not authenticated. Call authenticate() first."}
 
         try:
+            get_angel_rate_limiter().acquire(AngelBucket.ACCOUNT)
             rms_data = self._smart_connect.getRMS()
+            if is_rate_limit(rms_data):
+                logger.warning(
+                    "Angel rate limit: action=getRMS bucket=account source=broker_response attempt=1"
+                )
+                get_angel_rate_limiter().notify_rate_limit()
             return rms_data
         except Exception as e:
+            if is_rate_limit(e):
+                logger.warning(
+                    "Angel rate limit: action=getRMS bucket=account source=broker_exception attempt=1"
+                )
+                get_angel_rate_limiter().notify_rate_limit()
             return {"status": False, "message": f"Failed to fetch RMS: {e}"}
 
     def get_market_data(self, mode: str, exchange_tokens: Dict[str, list]) -> Dict[str, Any]:
@@ -167,8 +206,20 @@ class AngelOneClient:
             return {"status": False, "message": "Not authenticated. Call authenticate() first."}
 
         try:
-            return self._smart_connect.getMarketData(mode=mode, exchangeTokens=exchange_tokens)
+            get_angel_rate_limiter().acquire(AngelBucket.QUOTE)
+            res = self._smart_connect.getMarketData(mode=mode, exchangeTokens=exchange_tokens)
+            if is_rate_limit(res):
+                logger.warning(
+                    "Angel rate limit: action=getMarketData bucket=quote source=broker_response attempt=1"
+                )
+                get_angel_rate_limiter().notify_rate_limit()
+            return res
         except Exception as e:
+            if is_rate_limit(e):
+                logger.warning(
+                    "Angel rate limit: action=getMarketData bucket=quote source=broker_exception attempt=1"
+                )
+                get_angel_rate_limiter().notify_rate_limit()
             return {"status": False, "message": f"Failed to fetch market data: {e}"}
 
     # =========================================================================
@@ -188,4 +239,3 @@ class AngelOneClient:
         raise NotImplementedError(
             "CRITICAL SAFETY VIOLATION: Order cancellation is strictly prohibited in Phase 1."
         )
-

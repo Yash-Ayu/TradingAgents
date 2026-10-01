@@ -22,6 +22,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
+from .rate_limiter import AngelBucket, get_angel_rate_limiter
+from .security import (
+    install_secret_redaction,
+    is_rate_limit,
+    is_transient_network_error,
+)
+
+install_secret_redaction()
+
 logger = logging.getLogger(__name__)
 IST = ZoneInfo('Asia/Kolkata')
 
@@ -93,7 +102,7 @@ class MarketDataAdapter:
     def is_configured(self) -> bool:
         raise NotImplementedError
 
-    def get_candles(self, symbol: str, interval: str = '5m') -> Dict[str, Any]:
+    def get_candles(self, symbol: str, interval: str = '5m', allow_fallback: bool = False, **kwargs) -> Dict[str, Any]:
         raise NotImplementedError
 
     def get_quote(self, symbol: str) -> Dict[str, Any]:
@@ -183,7 +192,7 @@ class AngelOneMarketAdapter(MarketDataAdapter):
 
         raise ValueError(f"Could not resolve Angel One token for symbol: {symbol}")
 
-    def get_candles(self, symbol: str, interval: str = '5m') -> Dict[str, Any]:
+    def get_candles(self, symbol: str, interval: str = '5m', allow_fallback: bool = False, **kwargs) -> Dict[str, Any]:
         clean = symbol.strip().upper()
         if clean in {'DEMO', 'DEMO-EQ'}:
             return DemoMarketAdapter().get_candles(clean, interval=interval)
@@ -219,15 +228,63 @@ class AngelOneMarketAdapter(MarketDataAdapter):
             'todate': now.strftime('%Y-%m-%d %H:%M'),
         }
 
-        try:
-            resp = smart_connect.getCandleData(params)
-        except Exception as exc:
-            logger.warning(f"Angel One candle data request failed for {symbol}: {type(exc).__name__}. Falling back to research chart.")
-            return ResearchMarketAdapter().get_candles(symbol, interval=interval)
+        resp = None
+        limiter = get_angel_rate_limiter()
+        for attempt in range(2):
+            attempt_num = attempt + 1
+            try:
+                limiter.acquire(AngelBucket.CANDLE)
+                resp = smart_connect.getCandleData(params)
+                if is_rate_limit(resp):
+                    logger.warning(
+                        f"Angel rate limit: action=getCandleData bucket=candle source=broker_response attempt={attempt_num}"
+                    )
+                    limiter.notify_rate_limit()
+                    if not allow_fallback:
+                        raise ValueError('angel_rate_limited')
+                    logger.warning(f"Angel One candle data rate limited for {symbol}.")
+                    fallback = ResearchMarketAdapter().get_candles(symbol, interval=interval)
+                    fallback['source'] = 'RESEARCH_FALLBACK'
+                    fallback['is_fallback'] = True
+                    fallback['fallback_reason'] = 'angel_rate_limited'
+                    return fallback
+                break
+            except Exception as exc:
+                if is_rate_limit(exc) or str(exc) == 'angel_rate_limited':
+                    src = "broker_response" if str(exc) == 'angel_rate_limited' else "broker_exception"
+                    logger.warning(
+                        f"Angel rate limit: action=getCandleData bucket=candle source={src} attempt={attempt_num}"
+                    )
+                    limiter.notify_rate_limit()
+                    if not allow_fallback:
+                        raise ValueError('angel_rate_limited') from exc
+                    logger.warning(f"Angel One candle data rate limited for {symbol}: {exc}.")
+                    fallback = ResearchMarketAdapter().get_candles(symbol, interval=interval)
+                    fallback['source'] = 'RESEARCH_FALLBACK'
+                    fallback['is_fallback'] = True
+                    fallback['fallback_reason'] = 'angel_rate_limited'
+                    return fallback
+                if is_transient_network_error(exc) and attempt == 0:
+                    time.sleep(0.2)
+                    continue
+                if not allow_fallback:
+                    raise
+                logger.warning(f"Angel One candle data request failed for {symbol}: {type(exc).__name__}. Falling back to research chart.")
+                fallback = ResearchMarketAdapter().get_candles(symbol, interval=interval)
+                fallback['source'] = 'RESEARCH_FALLBACK'
+                fallback['is_fallback'] = True
+                fallback['fallback_reason'] = f"network_error: {type(exc).__name__}"
+                return fallback
 
         if not resp or not resp.get('status') or not resp.get('data'):
+            if not allow_fallback:
+                raise ValueError(f"Angel One candle data empty for {symbol}: {resp.get('message') if resp else 'no response'}")
             logger.warning(f"Angel One candle data empty for {symbol}. Falling back to research chart.")
-            return ResearchMarketAdapter().get_candles(symbol, interval=interval)
+            fallback = ResearchMarketAdapter().get_candles(symbol, interval=interval)
+            fallback['source'] = 'RESEARCH_FALLBACK'
+            fallback['is_fallback'] = True
+            fallback['fallback_reason'] = 'empty_response'
+            return fallback
 
         raw_rows = resp['data']
         rows = []
@@ -302,7 +359,15 @@ class AngelOneMarketAdapter(MarketDataAdapter):
 
         # 2. Fall back to REST quote snapshot
         client = self._get_client()
+        limiter = get_angel_rate_limiter()
+        limiter.acquire(AngelBucket.QUOTE)
         resp = client.get_market_data(mode='FULL', exchange_tokens={exchange: [token]})
+        if is_rate_limit(resp):
+            logger.warning(
+                "Angel rate limit: action=getMarketData bucket=quote source=broker_response attempt=1"
+            )
+            limiter.notify_rate_limit()
+            raise ValueError('angel_rate_limited')
 
         # Angel sessions can expire while this long-running service stays alive.
         # On an explicit auth-token failure, discard stale session state,
@@ -315,12 +380,26 @@ class AngelOneMarketAdapter(MarketDataAdapter):
             logger.warning("Angel One session expired; re-authenticating read-only market data session.")
             self._reset_session()
             client = self._get_client()
+            limiter.acquire(AngelBucket.AUTH)
             auth_res = client.authenticate()
+            if is_rate_limit(auth_res):
+                logger.warning(
+                    "Angel rate limit: action=authenticate bucket=auth source=broker_response attempt=1"
+                )
+                limiter.notify_rate_limit()
+                raise ValueError('angel_rate_limited')
             if not auth_res.get('status'):
                 raise ValueError(
                     f"Angel One re-authentication failed: {auth_res.get('message', 'unknown error')}"
                 )
+            limiter.acquire(AngelBucket.QUOTE)
             resp = client.get_market_data(mode='FULL', exchange_tokens={exchange: [token]})
+            if is_rate_limit(resp):
+                logger.warning(
+                    "Angel rate limit: action=getMarketData bucket=quote source=broker_response attempt=2"
+                )
+                limiter.notify_rate_limit()
+                raise ValueError('angel_rate_limited')
 
         if not resp or not resp.get('status'):
             raise ValueError(f"Failed to fetch Angel One quote: {resp.get('message') if resp else 'empty'}")
@@ -531,7 +610,7 @@ def search_instruments(query: str, limit: int = 15) -> List[Dict[str, Any]]:
                             'exchange': exch,
                             'token': tok,
                             'name': name,
-                            'type': itype or 'EQ',
+                            'type': 'INDEX' if itype == 'AMXIDX' else (itype or 'EQ'),
                             'lotsize': int(float(item.get('lotsize', 1))),
                         })
                         if len(results) >= limit:

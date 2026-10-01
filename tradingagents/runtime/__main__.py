@@ -63,15 +63,9 @@ def main(argv=None) -> int:
                                   analysis_symbol=args.analysis_symbol, calendar=calendar,
                                   interval=args.interval, max_order_value=args.max_order_value,
                                   max_order_qty=args.max_order_qty)
-    if args.once:
-        try:
-            service.start(background=False)
-            result = service.tick()
-            print(json.dumps(result))
-            return 1 if result.get('status') == 'error' else 0
-        finally:
-            service.close()
-    server = DashboardServer(service, host=args.host, port=args.port)
+    server = None
+    if not args.once:
+        server = DashboardServer(service, host=args.host, port=args.port)
     auto_start_env = os.environ.get('TRADINGAGENTS_AUTO_START', '').strip().lower() in {'1', 'true', 'yes'}
     should_auto_start = args.auto_start if args.auto_start is not None else auto_start_env
     if should_auto_start and not service.ledger.killed():
@@ -80,20 +74,39 @@ def main(argv=None) -> int:
                 symbol = args.analysis_symbol
                 if not symbol and service.instrument.exchange == 'NSE' and service.instrument.instrument_type == 'EQ':
                     symbol = service.instrument.symbol.removesuffix('-EQ') + '.NS'
+                elif not symbol and service.instrument.instrument_type == 'INDEX':
+                    symbol = service.instrument.symbol
                 if symbol:
-                    service.start_auto({'symbol': symbol})
-                    print(f'Paper desk: {server.origin} | source={args.source} | auto-started ({symbol})', flush=True)
+                    if service.graph_factory is not None:
+                        service.start()
+                    else:
+                        service.start_auto({'symbol': symbol})
+                    prefix = f'Paper desk: {server.origin} | ' if server else ''
+                    print(f'{prefix}source={args.source} | auto-started ({symbol})', flush=True)
                 else:
                     service.start()
-                    print(f'Paper desk: {server.origin} | source={args.source} | auto-started', flush=True)
+                    prefix = f'Paper desk: {server.origin} | ' if server else ''
+                    print(f'{prefix}source={args.source} | auto-started', flush=True)
             else:
                 service.start()
-                print(f'Paper desk: {server.origin} | source={args.source} | auto-started', flush=True)
+                prefix = f'Paper desk: {server.origin} | ' if server else ''
+                print(f'{prefix}source={args.source} | auto-started', flush=True)
         except Exception as exc:
-            print(f'Paper desk: {server.origin} | source={args.source} | auto-start skipped: {exc}', flush=True)
-    else:
+            prefix = f'Paper desk: {server.origin} | ' if server else ''
+            print(f'{prefix}source={args.source} | auto-start skipped: {exc}', flush=True)
+    elif not args.once:
         status_msg = 'starts paused (emergency stop latched)' if service.ledger.killed() else 'starts paused'
         print(f'Paper desk: {server.origin} | source={args.source} | {status_msg}', flush=True)
+
+    if args.once:
+        try:
+            if not should_auto_start:
+                service.start(background=False)
+            result = service.tick()
+            print(json.dumps(result))
+            return 1 if result.get('status') == 'error' else 0
+        finally:
+            service.close()
     try:
         server.serve_forever(poll_interval=0.2)
     except KeyboardInterrupt:

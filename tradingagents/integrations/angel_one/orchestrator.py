@@ -138,6 +138,8 @@ class FOPipelineOrchestrator:
         strategy_name: str = "DEFAULT_STRATEGY",
         signal: Optional[ValidatedSignal] = None,
         data_source: str = "LIVE_ANGEL_ONE",
+        instrument_type: Optional[DerivativeType] = None,
+        trade_type: str = "INTRADAY",
     ) -> PipelineExecutionResult:
         """
         Execute full pipeline from AI signal to virtual execution.
@@ -187,12 +189,20 @@ class FOPipelineOrchestrator:
                     reason="Angel One live market data stream is disconnected. Fail-closed: NO TRADE.",
                 )
 
-        # Step 1: Dynamic F&O Contract Resolution (Phase 1)
+        # Step 1: Dynamic F&O Contract Resolution (Phase 1 & Phase 3/4)
+        if instrument_type is None:
+            is_index = underlying.upper().strip() in (
+                "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYMIDCAP100", "SENSEX", "BANKEX"
+            )
+            resolved_inst_type = DerivativeType.OPTIDX if is_index else DerivativeType.OPTSTK
+        else:
+            resolved_inst_type = instrument_type
+
         res_req = ResolutionRequest(
             underlying=underlying,
             spot_price=spot_price,
             bias=bias,
-            instrument_type=DerivativeType.OPTIDX,
+            instrument_type=resolved_inst_type,
             strike_mode=strike_mode,
             strike_offset=strike_offset,
             preferred_expiry=preferred_expiry,
@@ -288,6 +298,8 @@ class FOPipelineOrchestrator:
             target=target,
             idempotency_key=idempotency_key,
             data_source=data_source,
+            trade_type=trade_type,
+            strategy_id=strategy_name,
         )
 
         if order.status != "FILLED":

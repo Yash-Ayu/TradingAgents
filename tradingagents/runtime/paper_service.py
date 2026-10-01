@@ -2,20 +2,52 @@
 from __future__ import annotations
 
 import copy
+import logging
 import math
 import re
 import threading
+import time
 from datetime import datetime, timedelta
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+from tradingagents.integrations.angel_one.models import MarketBias
+from tradingagents.integrations.angel_one.orchestrator import FOPipelineOrchestrator
+from tradingagents.integrations.angel_one.scrip_master import ScripMasterManager
 
 from .ai_analysis import AIAnalysis
+from .btst_engine import BTSTStrategyEngine
+from .fo_scanner import FOScanner, ScanEvaluationResult, SetupState
 from .market_snapshot import IST, SessionCalendar, fresh, number, timestamp
 from .safe_runtime import RiskGate
+
+logger = logging.getLogger(__name__)
+
+
+def _parse_candle_timestamp(ts_val: Any) -> datetime | None:
+    """Robustly parse a candle timestamp value into an IST-aware datetime."""
+    if isinstance(ts_val, datetime):
+        return ts_val if ts_val.tzinfo is not None else ts_val.replace(tzinfo=IST)
+    if isinstance(ts_val, str):
+        try:
+            dt = timestamp(ts_val)
+            return dt if dt.tzinfo is not None else dt.replace(tzinfo=IST)
+        except Exception:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%d-%b-%Y %H:%M:%S"):
+                try:
+                    return datetime.strptime(ts_val, fmt).replace(tzinfo=IST)
+                except ValueError:
+                    pass
+    return None
 
 
 class PaperTradingService:
     def __init__(self, feed, ledger, *, graph_factory=None, analysis_symbol=None,
                  calendar=None, interval=60, max_errors=3, max_order_value=10000,
-                 max_order_qty=50, risk_fraction=0.01, daily_loss_limit=3.0, clock=None):
+                 max_order_qty=50, risk_fraction=0.01, daily_loss_limit=3.0, clock=None,
+                 scrip_master=None, scanner_batch_size=12):
         self.feed, self.ledger = feed, ledger
         self.instrument = feed.instrument
         self.graph_factory = graph_factory
@@ -39,6 +71,9 @@ class PaperTradingService:
             raise ValueError('risk_fraction_too_large')
         self.daily_loss_limit = number(daily_loss_limit, 'daily_loss_limit', minimum=0.01)
         self.clock = clock or (lambda: datetime.now(IST))
+        if clock is not None and hasattr(self.feed, 'clock') and not getattr(self.feed, '_custom_clock', False):
+            self.feed.clock = self.clock
+            self.feed._custom_clock = True
         self.gate = RiskGate()
         self.lock = threading.RLock()
         self.cycle_lock = threading.Lock()
@@ -53,6 +88,37 @@ class PaperTradingService:
         self.last_decision = None
         self.last_risk = {'risk_state': 'unknown', 'allow_trade': False, 'reasons': ['No market data']}
         self.ledger.bind(f'{self.feed.source}:{self.instrument.key}')
+        self.scrip_master = scrip_master or ScripMasterManager()
+        self.fo_orchestrator = FOPipelineOrchestrator(scrip_master=self.scrip_master)
+        self.fo_scanner = FOScanner(scrip_master=self.scrip_master)
+        self.btst_engine = BTSTStrategyEngine()
+        self.scanner_batch_size = max(1, int(scanner_batch_size))
+        self._scanner_rotation_idx = 0
+        self.last_scanner_result: dict = {
+            'universe_count': 0,
+            'screened_count': 0,
+            'scanned_count': 0,
+            'shortlisted_count': 0,
+            'scanner_evaluated_count': 0,
+            'active_candidates': [],
+            'rejected_count': 0,
+            'data_unavailable_count': 0,
+            'scan_duration': 0.0,
+            'last_scan_timestamp': None,
+            'batch_size': self.scanner_batch_size,
+            'rotation_index': 0,
+            'next_rotation_index': 0,
+            'rejected_by_reason': {},
+            'data_source': self.feed.source,
+            'evaluations': [],
+            'execution_allowed': False,
+        }
+        self.last_btst_result: dict = {
+            'window_active': False,
+            'window_status': 'Initial idle state',
+            'timestamp': None,
+            'candidates': [],
+        }
 
     def _stamp(self):
         return timestamp(self.clock()).isoformat()
@@ -126,7 +192,10 @@ class PaperTradingService:
         fresh(timestamp(snapshot.get('bar_timestamp')) + timedelta(minutes=1), now, 180)
         for key in ('price', 'vix', 'atr'):
             number(snapshot.get(key), key, minimum=0.000001)
-        self.instrument.validate_trade(now)
+        if hasattr(self.instrument, 'validate_reference'):
+            self.instrument.validate_reference(now)
+        elif getattr(self.instrument, 'instrument_type', None) != 'INDEX':
+            self.instrument.validate_trade(now)
 
     def tick(self):
         if not self.cycle_lock.acquire(blocking=False):
@@ -168,10 +237,14 @@ class PaperTradingService:
                 result = self._commit(snapshot, generation, 'Sell', flatten=True)
                 result['exit_reason'] = 'protective_stop_or_target'
             elif not risk['allow_trade'] or closing:
-                result = self._commit(snapshot, generation, 'Sell', flatten=True) if (
-                    (risk.get('flatten_positions') or closing) and account['positions']
-                ) else {'status': 'risk_blocked' if not risk['allow_trade'] else 'closing_window',
-                        'reasons': risk['reasons']}
+                if (risk.get('flatten_positions') or closing) and account['positions']:
+                    result = self._commit(snapshot, generation, 'Sell', flatten=True)
+                else:
+                    if not closing and not risk['allow_trade']:
+                        self._sync_fo_positions(snapshot)
+                        self._scan_and_execute_fo(snapshot, account, generation, allow_execution=False)
+                    result = {'status': 'risk_blocked' if not risk['allow_trade'] else 'closing_window',
+                            'reasons': risk['reasons']}
             elif self.auto_enabled:
                 result = self._auto_tick(snapshot, account, generation)
             elif self.graph_factory is None:
@@ -217,6 +290,8 @@ class PaperTradingService:
             expected = self.analysis_symbol
             if self.instrument.exchange == 'NSE' and self.instrument.instrument_type == 'EQ':
                 expected = self.instrument.symbol.removesuffix('-EQ') + '.NS'
+            elif not expected and self.instrument.instrument_type == 'INDEX':
+                expected = self.instrument.symbol
             if not expected or body['symbol'] != expected:
                 raise ValueError('analysis_symbol_must_match_trading_instrument')
             if self.graph_factory:
@@ -236,7 +311,344 @@ class PaperTradingService:
                 self.ai.set_auto(False)
                 raise
 
+    def _sync_fo_positions(self, snapshot):
+        for pos in self.fo_orchestrator.paper_engine.get_open_positions():
+            sym = pos.symbol
+            ltp = snapshot['price'] if sym == self.instrument.symbol else pos.current_mark
+            self.fo_orchestrator.paper_engine.update_mark_price(sym, ltp)
+
+    def _validate_symbol_candles(self, sym: str, df: pd.DataFrame, source: str, now: datetime) -> tuple[bool, str]:
+        """Strict data quality, freshness, and sanity checks for per-symbol candles."""
+        if df is None or len(df) < 25:
+            return False, f"insufficient_bars_{len(df) if df is not None else 0}"
+
+        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        for col in required_cols:
+            if col not in df.columns:
+                return False, f"missing_column_{col}"
+
+        # 1. Finite numbers and positivity
+        for col in required_cols:
+            vals = df[col].values
+            if not np.all(np.isfinite(vals)):
+                return False, f"non_finite_values_in_{col}"
+
+        prices = df['Close'].values
+        if np.any(prices <= 0.0):
+            return False, "non_positive_price_detected"
+
+        # 2. Strict OHLC hierarchy check: High >= Low, High >= Open, High >= Close, Low <= Open, Low <= Close
+        if np.any(df['High'] < df['Low']) or np.any(df['High'] < df['Open']) or np.any(df['High'] < df['Close']):
+            return False, "malformed_ohlc_relationship"
+        if np.any(df['Low'] > df['Open']) or np.any(df['Low'] > df['Close']):
+            return False, "malformed_ohlc_relationship"
+
+        # 3. Flat / dead feed detection: price std and range over last 20 bars
+        recent_closes = prices[-20:]
+        if float(np.std(recent_closes)) <= 1e-6:
+            return False, "flat_dead_feed_zero_std"
+
+        recent_range = float(df['High'].iloc[-20:].max() - df['Low'].iloc[-20:].min())
+        if recent_range <= 1e-6:
+            return False, "flat_dead_feed_zero_range"
+
+        if float(df['Volume'].iloc[-20:].sum()) <= 0:
+            return False, "dead_feed_zero_volume"
+
+        # 4. Timestamp & Freshness validation
+        if 'Timestamp' in df.columns:
+            last_ts = df['Timestamp'].iloc[-1]
+            last_dt = _parse_candle_timestamp(last_ts)
+            if last_dt is None:
+                return False, "invalid_or_missing_candle_timestamp"
+            if last_dt > now + timedelta(minutes=5):
+                return False, "future_candle_timestamp"
+            # If live Angel market is open, verify freshness (maximum 15 min / 3 bars staleness)
+            if self.feed.source == 'angel' and self.calendar.is_open(now):
+                age_seconds = (now - last_dt).total_seconds()
+                if age_seconds > 900:
+                    return False, f"stale_candle_data_age_{int(age_seconds)}s"
+
+        return True, "valid"
+
+    def _scan_and_execute_fo(self, snapshot, account, generation, allow_execution=True):
+        start_time = time.monotonic()
+        now = timestamp(self.clock())
+
+        # Ensure orchestrator and scanner share authoritative scrip master
+        self.fo_scanner.scrip_master = self.scrip_master
+        self.fo_orchestrator.scrip_master = self.scrip_master
+        self.fo_orchestrator.resolver.scrip_master = self.scrip_master
+
+        # Stage 1: Dynamic Universe Discovery from Scrip Master
+        fo_universe = self.scrip_master.get_fo_universe()
+        universe_count = len(fo_universe)
+        if universe_count == 0:
+            self.last_scanner_result = {
+                'universe_count': 0,
+                'screened_count': 0,
+                'scanned_count': 0,
+                'shortlisted_count': 0,
+                'scanner_evaluated_count': 0,
+                'active_candidates': [],
+                'rejected_count': 0,
+                'data_unavailable_count': 0,
+                'scan_duration': 0.0,
+                'last_scan_timestamp': now.isoformat(),
+                'batch_size': self.scanner_batch_size,
+                'rotation_index': self._scanner_rotation_idx,
+                'next_rotation_index': self._scanner_rotation_idx,
+                'rejected_by_reason': {'empty_universe': 1},
+                'data_source': self.feed.source,
+                'evaluations': [],
+                'execution_allowed': bool(allow_execution),
+            }
+            return None
+
+        # Prioritized universe: indices -> liquid stocks -> remaining F&O underlyings
+        ordered_symbols = self.fo_scanner.discover_universe()
+
+        # If analysis_symbol is configured, give it priority in screening
+        if self.analysis_symbol:
+            clean_analysis = self.analysis_symbol.removesuffix('.NS').removesuffix('-EQ')
+            if clean_analysis in fo_universe and clean_analysis in ordered_symbols:
+                ordered_symbols.remove(clean_analysis)
+                ordered_symbols.insert(0, clean_analysis)
+
+        # Stage 2: Workload Bounding and Rotation to respect API limits
+        batch_size = self.scanner_batch_size
+        indices = [s for s in ordered_symbols if fo_universe.get(s, {}).get('is_index', False)]
+
+        if len(ordered_symbols) <= batch_size:
+            symbols_to_screen = list(ordered_symbols)
+            start_idx = 0
+            self._scanner_rotation_idx = 0
+        else:
+            # Allocate up to 3 slots for benchmark indices, remaining slots for rotating stocks
+            priority_indices = indices[:min(3, len(indices))]
+            remaining_slots = max(1, batch_size - len(priority_indices))
+            pool = [s for s in ordered_symbols if s not in priority_indices]
+            if pool:
+                start_idx = self._scanner_rotation_idx % len(pool)
+                end_idx = start_idx + remaining_slots
+                if end_idx <= len(pool):
+                    rotating_slice = pool[start_idx:end_idx]
+                else:
+                    rotating_slice = pool[start_idx:] + pool[:end_idx - len(pool)]
+                self._scanner_rotation_idx = (start_idx + remaining_slots) % len(pool)
+            else:
+                rotating_slice = []
+                start_idx = 0
+            symbols_to_screen = priority_indices + rotating_slice
+
+        # BTST Window check
+        in_btst, window_status = self.btst_engine.is_in_btst_window(now)
+        btst_candidates = []
+
+        curr_sym = self.instrument.symbol.removesuffix('-EQ').removesuffix('.NS')
+        screened_count = 0
+        shortlisted_count = 0
+        scanner_evaluated_count = 0
+        rejected_count = 0
+        data_unavailable_count = 0
+        scanned_candidates = []
+        evaluations = []
+        rejected_by_reason: dict[str, int] = {}
+        executed_result = None
+
+        # Stage 2b: Data Acquisition & Fast Lightweight Screening
+        shortlisted_items = []
+
+        for sym in symbols_to_screen:
+            screened_count += 1
+            df = None
+            candle_source = self.feed.source
+
+            # Guardrail 4: Per-symbol real market data isolation.
+            # Never reuse currently selected instrument's snapshot chart for any other symbol.
+            if sym == curr_sym and snapshot and len(snapshot.get('chart', [])) >= 25:
+                chart_data = snapshot['chart']
+                try:
+                    df = pd.DataFrame(chart_data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+                    candle_source = 'SNAPSHOT_PRIMARY'
+                except Exception:
+                    df = None
+            else:
+                try:
+                    from .market_adapter import get_active_market_adapter
+                    adapter = get_active_market_adapter(preferred_source=self.feed.source)
+                    candles = adapter.get_candles(sym, interval='5m')
+                    candle_source = candles.get('source', 'UNKNOWN')
+
+                    # Guardrail 5: Provenance gate — Reject fallback/synthetic data masquerading as Angel live data
+                    if self.feed.source == 'angel' and candle_source != 'LIVE_ANGEL_ONE':
+                        fail_reason = f"provenance_rejected_{candle_source}"
+                        data_unavailable_count += 1
+                        rejected_count += 1
+                        rejected_by_reason[fail_reason] = rejected_by_reason.get(fail_reason, 0) + 1
+                        evaluations.append(ScanEvaluationResult(
+                            symbol=sym, underlying=sym, spot_price=0.0,
+                            state=SetupState.NO_SETUP, bias=MarketBias.NEUTRAL,
+                            reason=f"Data rejected: {fail_reason}. Fail-closed."
+                        ))
+                        continue
+
+                    # Guardrail 3: Schema extraction from candles['chart']
+                    raw_chart = candles.get('chart') or candles.get('rows', [])
+                    if isinstance(raw_chart, list) and len(raw_chart) >= 25:
+                        if all(isinstance(r, (list, tuple)) and len(r) >= 6 for r in raw_chart[:25]):
+                            df = pd.DataFrame([r[:6] for r in raw_chart], columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+                        else:
+                            df = None
+                except Exception as exc:
+                    logger.debug(f"Could not retrieve candles for {sym}: {exc}")
+                    df = None
+
+            # Guardrail 6 & 7: Stale, flat, dead, or missing data validation
+            if df is None:
+                fail_reason = "missing_or_malformed_candles"
+                data_unavailable_count += 1
+                rejected_count += 1
+                rejected_by_reason[fail_reason] = rejected_by_reason.get(fail_reason, 0) + 1
+                evaluations.append(ScanEvaluationResult(
+                    symbol=sym, underlying=sym, spot_price=0.0,
+                    state=SetupState.NO_SETUP, bias=MarketBias.NEUTRAL,
+                    reason="Market data unavailable or malformed. Fail-closed."
+                ))
+                continue
+
+            valid, reason = self._validate_symbol_candles(sym, df, candle_source, now)
+            if not valid:
+                if "stale" in reason or "missing" in reason or "insufficient" in reason or "timestamp" in reason:
+                    data_unavailable_count += 1
+                rejected_count += 1
+                rejected_by_reason[reason] = rejected_by_reason.get(reason, 0) + 1
+                evaluations.append(ScanEvaluationResult(
+                    symbol=sym, underlying=sym, spot_price=float(df['Close'].iloc[-1]) if 'Close' in df.columns and len(df) > 0 else 0.0,
+                    state=SetupState.NO_SETUP, bias=MarketBias.NEUTRAL,
+                    reason=f"Data quality gate failed: {reason}. Fail-closed."
+                ))
+                continue
+
+            # Stage 3: Candidate qualified for deep technical analysis
+            latest_price = float(df['Close'].iloc[-1])
+            shortlisted_count += 1
+            shortlisted_items.append((sym, df, latest_price))
+
+        # Stage 4: Deeper F&O Scanning / Early-Setup Evaluation / Orchestration
+        for sym, df, _spot_price in shortlisted_items:
+            scanner_evaluated_count += 1
+            is_index = fo_universe.get(sym, {}).get('is_index', False)
+
+            # 4a. BTST Evaluation if in window
+            if in_btst:
+                try:
+                    btst_res = self.btst_engine.evaluate_btst_candidate(sym, df, eval_time=now)
+                    if btst_res.candidate is not None:
+                        btst_candidates.append(btst_res.candidate)
+                        if allow_execution and not executed_result and len(self.fo_orchestrator.paper_engine.get_open_positions()) < self.fo_orchestrator.risk_engine.config.max_open_positions:
+                            contract_budget = min(account['cash'], self.max_order_value)
+                            est_prem = max(10.0, btst_res.candidate.spot_price * 0.015)
+                            lot_size = fo_universe.get(sym, {}).get('lot_size', 50)
+                            lots = max(1, min(self.max_order_qty, math.floor(contract_budget / max(1.0, est_prem * lot_size))))
+                            pipe_res = self.fo_orchestrator.process_signal(
+                                underlying=sym,
+                                spot_price=btst_res.candidate.spot_price,
+                                bias=btst_res.candidate.bias,
+                                proposed_lots=lots,
+                                stop_loss=btst_res.candidate.stop_loss,
+                                target=btst_res.candidate.target,
+                                evaluation_time=now,
+                                strategy_name=btst_res.candidate.strategy_id,
+                                trade_type="BTST",
+                                data_source="LIVE_ANGEL_ONE" if self.feed.source == 'angel' else "SIMULATION",
+                            )
+                            if pipe_res.success:
+                                executed_result = {
+                                    'status': 'executed_btst_paper',
+                                    'trade_type': 'BTST',
+                                    'contract': pipe_res.contract.trading_symbol if pipe_res.contract else sym,
+                                    'lots': lots
+                                }
+                except Exception as exc:
+                    logger.warning(f"BTST evaluation failed for {sym}: {exc}")
+
+            # 4b. Intraday Early Setup F&O Evaluation
+            try:
+                res = self.fo_scanner.evaluate_price_action(sym, df, is_index=is_index)
+                evaluations.append(res)
+                if res.candidate is not None:
+                    scanned_candidates.append(res.candidate)
+                    if allow_execution and not executed_result and len(self.fo_orchestrator.paper_engine.get_open_positions()) < self.fo_orchestrator.risk_engine.config.max_open_positions:
+                        contract_budget = min(account['cash'], self.max_order_value)
+                        est_prem = max(10.0, res.candidate.spot_price * 0.015)
+                        lot_size = fo_universe.get(sym, {}).get('lot_size', 50)
+                        lots = max(1, min(self.max_order_qty, math.floor(contract_budget / max(1.0, est_prem * lot_size))))
+                        pipe_res = self.fo_orchestrator.process_signal(
+                            underlying=sym,
+                            spot_price=res.candidate.spot_price,
+                            bias=res.candidate.bias,
+                            proposed_lots=lots,
+                            stop_loss=res.candidate.stop_loss,
+                            target=res.candidate.target,
+                            evaluation_time=now,
+                            strategy_name=res.candidate.setup_name,
+                            trade_type="INTRADAY",
+                            data_source="LIVE_ANGEL_ONE" if self.feed.source == 'angel' else "SIMULATION",
+                        )
+                        if pipe_res.success:
+                            executed_result = {
+                                'status': 'executed_intraday_fo_paper',
+                                'trade_type': 'INTRADAY',
+                                'contract': pipe_res.contract.trading_symbol if pipe_res.contract else sym,
+                                'lots': lots
+                            }
+                else:
+                    rejected_count += 1
+                    rejected_by_reason[res.state.value] = rejected_by_reason.get(res.state.value, 0) + 1
+            except Exception as exc:
+                logger.warning(f"FO Scanner evaluation failed for {sym}: {exc}")
+                rejected_count += 1
+                rejected_by_reason['evaluation_exception'] = rejected_by_reason.get('evaluation_exception', 0) + 1
+
+        # Finalize and Populate Telemetry BEFORE returning execution result
+        scan_duration = round(time.monotonic() - start_time, 4)
+        self.last_btst_result = {
+            'window_active': in_btst,
+            'window_status': window_status,
+            'timestamp': now.isoformat(),
+            'candidates': [c.__dict__ if hasattr(c, '__dict__') else c for c in btst_candidates],
+        }
+        self.last_scanner_result = {
+            'universe_count': universe_count,
+            'screened_count': screened_count,
+            'scanned_count': screened_count,
+            'shortlisted_count': shortlisted_count,
+            'scanner_evaluated_count': scanner_evaluated_count,
+            'active_candidates': [c.__dict__ if hasattr(c, '__dict__') else c for c in scanned_candidates],
+            'rejected_count': rejected_count,
+            'data_unavailable_count': data_unavailable_count,
+            'scan_duration': scan_duration,
+            'last_scan_timestamp': now.isoformat(),
+            'batch_size': batch_size,
+            'rotation_index': start_idx,
+            'next_rotation_index': self._scanner_rotation_idx,
+            'rejected_by_reason': rejected_by_reason,
+            'data_source': self.feed.source,
+            'evaluations': [{'symbol': e.symbol, 'state': e.state.value if hasattr(e.state, 'value') else str(e.state), 'reason': e.reason} for e in evaluations],
+            'execution_allowed': bool(allow_execution),
+        }
+
+        if executed_result:
+            return executed_result
+        return None
+
     def _auto_tick(self, snapshot, account, generation):
+        self._sync_fo_positions(snapshot)
+        fo_exec = self._scan_and_execute_fo(snapshot, account, generation, allow_execution=True)
+        if fo_exec:
+            return fo_exec
+
         ai = self.ai.status()
         result = ai['result']
         if ai['state'] == 'error':
@@ -260,6 +672,14 @@ class PaperTradingService:
         if ai['worker_busy']:
             return {'status': 'analyzing', 'reason': 'protective_monitoring_continues'}
         if self.last_analysis_bar != snapshot['bar_timestamp']:
+            is_valid_research_ticker = (
+                bool(self.analysis_symbol)
+                and isinstance(self.analysis_symbol, str)
+                and bool(re.fullmatch(r'[A-Za-z0-9^][A-Za-z0-9.^=-]{0,39}', self.analysis_symbol))
+                and self.analysis_symbol.upper() not in {'DEMO', 'DEMO-EQ'}
+            )
+            if not is_valid_research_ticker:
+                return {'status': 'monitoring', 'reason': 'waiting_for_next_completed_bar'}
             context = {key: snapshot[key] for key in
                        ('price', 'timestamp', 'bar_timestamp', 'vix', 'atr', 'atr_ratio', 'trend_strength')}
             context.update(candles=snapshot.get('chart', [])[-30:],
@@ -277,6 +697,12 @@ class PaperTradingService:
                 return {'status': 'blocked', 'reason': 'stopped_during_analysis'}
             now = timestamp(self.clock())
             self._validate(snapshot, now)
+            # Strict trade execution validation: an INDEX is reference-only and cannot be executed directly
+            try:
+                self.instrument.validate_trade(now)
+            except ValueError as exc:
+                reason = 'non_tradable_execution_instrument' if str(exc) == 'non_tradable_instrument' else str(exc)
+                return {'status': 'blocked', 'reason': reason}
             if self.feed.source != 'demo' and not self.calendar.is_open(now):
                 return {'status': 'blocked', 'reason': 'market_closed_during_analysis'}
             direction = str(signal).strip().lower()
@@ -328,7 +754,11 @@ class PaperTradingService:
                 except ValueError:
                     risk = {'risk_state': 'unknown', 'allow_trade': False, 'reasons': ['Market data is stale']}
             killed = self.ledger.killed()
-            return {'auto_enabled': self.auto_enabled, 'ai': self.ai.status(), 'mode': 'paper', 'source': self.feed.source,
+            fo_pos = [p.model_dump() for p in self.fo_orchestrator.paper_engine.get_open_positions()]
+            fo_orders = self.fo_orchestrator.paper_engine.get_orders(20)
+            fo_history = self.fo_orchestrator.paper_engine.get_trade_history(20)
+            fo_metrics = self.fo_orchestrator.paper_engine.get_performance_metrics().model_dump()
+            return {'auto_enabled': self.auto_enabled, 'ai': self.ai.status(), 'mode': 'paper', 'live_execution': False, 'source': self.feed.source,
                     'status': 'running' if self.running else 'stopped',
                     'connection': 'connected' if self.feed.connected else 'not_connected',
                     'instrument': self.instrument.as_dict(), 'analysis_symbol': self.analysis_symbol,
@@ -339,6 +769,9 @@ class PaperTradingService:
                     'account': self.ledger.account(), 'last_result': copy.deepcopy(self.last_result),
                     'last_decision': self.last_decision, 'last_error': self.last_error,
                     'error_count': self.errors, 'interval_seconds': self.interval,
+                    'fo_positions': fo_pos, 'fo_orders': fo_orders, 'fo_history': fo_history,
+                    'fo_metrics': fo_metrics, 'fo_scanner': copy.deepcopy(self.last_scanner_result),
+                    'btst': copy.deepcopy(self.last_btst_result),
                     **self.ledger.history()}
 
     def close(self):
