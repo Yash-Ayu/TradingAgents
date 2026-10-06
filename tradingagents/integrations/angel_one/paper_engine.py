@@ -470,12 +470,15 @@ class FOPaperTradingEngine:
 
             return order
 
-    def mark_positions_unknown_data(self, is_unknown: bool = True) -> None:
-        """Mark open positions with uncertain/unknown data state when live feed disconnects."""
+    def mark_positions_unknown_data(self, is_unknown: bool = True, symbol: Optional[str] = None) -> None:
+        """Mark open position(s) with uncertain/unknown data state when live feed disconnects or quote is unavailable."""
         with self.lock:
-            self.conn.execute("UPDATE paper_positions SET is_unknown_data=?", (1 if is_unknown else 0,))
+            if symbol:
+                self.conn.execute("UPDATE paper_positions SET is_unknown_data=? WHERE symbol=?", (1 if is_unknown else 0, symbol))
+            else:
+                self.conn.execute("UPDATE paper_positions SET is_unknown_data=?", (1 if is_unknown else 0,))
             logger.warning(
-                f"Positions is_unknown_data set to {is_unknown}. Automated exits {'PAUSED' if is_unknown else 'RESUMED'}."
+                f"Position(s) {'(' + symbol + ')' if symbol else ''} is_unknown_data set to {is_unknown}. Automated exits {'PAUSED' if is_unknown else 'RESUMED'}."
             )
 
     def update_mark_price(self, symbol: str, ltp: float) -> Optional[Dict[str, Any]]:

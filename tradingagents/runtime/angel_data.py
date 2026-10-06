@@ -53,6 +53,7 @@ class AngelReadOnlyFeed:
         self._rate_limit_cooldown_sec: float = self.limiter.cooldown_sec
         self._cached_broker_account: tuple[float, dict[str, Any]] | None = None
         self._broker_account_ttl_sec: float = float(os.environ.get("ANGEL_ACCOUNT_CACHE_TTL", 30.0))
+        self._candle_cache: dict[str, list] = {}
 
     # Hard-block any broker mutation APIs on this read-only feed
     def placeOrder(self, *args, **kwargs):
@@ -264,7 +265,19 @@ class AngelReadOnlyFeed:
                 'fromdate': (req_now - timedelta(hours=3)).strftime('%Y-%m-%d %H:%M'),
                 'todate': req_now.strftime('%Y-%m-%d %H:%M'),
             }), 'getCandleData')
-            candles = self._data(candles_resp)
+            raw_candles = self._data(candles_resp)
+            token_key = f"{self.instrument.exchange}:{self.instrument.token}"
+
+            if isinstance(raw_candles, list):
+                cached_bars = self._candle_cache.get(token_key, [])
+                by_timestamp = {r[0]: r for r in cached_bars if isinstance(r, list) and len(r) >= 6}
+                for r in raw_candles:
+                    if isinstance(r, list) and len(r) >= 6:
+                        by_timestamp[r[0]] = r
+                candles = sorted(by_timestamp.values(), key=lambda r: r[0])[-120:]
+                self._candle_cache[token_key] = candles
+            else:
+                candles = raw_candles
 
             if self._custom_clock:
                 candle_now = timestamp(self.clock())

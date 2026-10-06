@@ -249,10 +249,65 @@ class FOPipelineOrchestrator:
 
         resolved_entry_price = entry_price or spot_price * 0.01
 
-        # Default SL and Target if not explicitly provided (Safety guardrail)
-        resolved_sl = stop_loss
+        # Derive / normalize option-level stop_loss and target
+        # Scanner candidates provide SL and Target in underlying spot units (e.g. SL 2480, Target 2540 for spot 2500)
+        # Option execution and deterministic risk engine evaluate option premium (e.g. entry ₹45.0)
+        # Mandatory invariants for BUY options: 0 < resolved_sl < resolved_entry_price and resolved_target > resolved_entry_price.
+
+        # 1. Normalize Stop Loss
+        resolved_sl = None
+        if stop_loss is not None:
+            if 0 < stop_loss < resolved_entry_price:
+                # Already in option premium units
+                resolved_sl = round(stop_loss, 2)
+            elif spot_price > 0:
+                # Spot units -> derive option SL from spot risk percentage
+                spot_risk_pct = abs(spot_price - stop_loss) / spot_price
+                opt_risk_pct = min(0.40, max(0.15, spot_risk_pct * 2.0))
+                resolved_sl = round(max(0.05, resolved_entry_price * (1.0 - opt_risk_pct)), 2)
+
         if resolved_sl is None and self.risk_engine.config.enforce_stop_loss:
-            resolved_sl = round(resolved_entry_price * 0.75, 2)
+            resolved_sl = round(max(0.05, resolved_entry_price * 0.75), 2)
+
+        # 2. Normalize Target
+        resolved_target = None
+        if target is not None:
+            if target > resolved_entry_price and (spot_price <= 0 or target < spot_price * 0.5):
+                # Already in option premium units
+                resolved_target = round(target, 2)
+            elif spot_price > 0:
+                # Spot units -> derive option target from spot reward percentage
+                spot_reward_pct = abs(target - spot_price) / spot_price
+                opt_reward_pct = max(0.25, min(1.50, spot_reward_pct * 3.0))
+                resolved_target = round(resolved_entry_price * (1.0 + opt_reward_pct), 2)
+
+        if resolved_target is None:
+            resolved_target = round(resolved_entry_price * 1.50, 2)
+
+        # Mandatory SL & Target invariants for F&O/BTST paper trades
+        if not (resolved_sl is not None and 0 < resolved_sl < resolved_entry_price):
+            logger.warning(f"Pipeline halted: Invalid option SL ₹{resolved_sl} vs entry ₹{resolved_entry_price}")
+            return PipelineExecutionResult(
+                status="INVALID_STOP_LOSS",
+                success=False,
+                underlying=underlying,
+                action="BUY",
+                contract=contract,
+                data_source=data_source,
+                reason=f"Option SL (₹{resolved_sl}) must be strictly positive and below entry (₹{resolved_entry_price}).",
+            )
+
+        if not (resolved_target is not None and resolved_target > resolved_entry_price):
+            logger.warning(f"Pipeline halted: Invalid option Target ₹{resolved_target} vs entry ₹{resolved_entry_price}")
+            return PipelineExecutionResult(
+                status="INVALID_TARGET",
+                success=False,
+                underlying=underlying,
+                action="BUY",
+                contract=contract,
+                data_source=data_source,
+                reason=f"Option Target (₹{resolved_target}) must be strictly above entry (₹{resolved_entry_price}).",
+            )
 
         # Step 2: Deterministic Risk Engine Evaluation (Phase 2)
         risk_req = RiskEvaluationRequest(
@@ -261,7 +316,7 @@ class FOPipelineOrchestrator:
             proposed_lots=proposed_lots,
             entry_price=resolved_entry_price,
             stop_loss=resolved_sl,
-            target=target,
+            target=resolved_target,
             evaluation_time=eval_dt,
             quote_timestamp=quote_timestamp,
             bid_price=bid_price,
@@ -295,7 +350,7 @@ class FOPipelineOrchestrator:
             lots=risk_result.allocated_lots,
             current_price=resolved_entry_price,
             stop_loss=resolved_sl,
-            target=target,
+            target=resolved_target,
             idempotency_key=idempotency_key,
             data_source=data_source,
             trade_type=trade_type,

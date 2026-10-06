@@ -41,12 +41,12 @@ class MockScripMaster:
         return ["NIFTY", "RELIANCE"]
 
 
-def _make_candidate(symbol="RELIANCE", spot_price=2500.0):
+def _make_candidate(symbol="RELIANCE", spot_price=2500.0, is_index=False):
     return ScanCandidate(
         symbol=symbol,
         underlying=symbol,
-        is_index=False,
-        instrument_type=DerivativeType.OPTSTK,
+        is_index=is_index,
+        instrument_type=DerivativeType.OPTIDX if is_index else DerivativeType.OPTSTK,
         bias=MarketBias.BULLISH,
         action="CE_BUY",
         spot_price=spot_price,
@@ -101,29 +101,38 @@ def _make_service(tmp_path, vix=14.0, drawdown_pct=0.0, clock_time=None, source=
 
 
 def test_a_risk_blocked_cycle_runs_discovery_without_execution(tmp_path):
-    """Test A: When RiskGate blocks trading, scanner runs discovery, updates telemetry, but NEVER executes."""
+    """Test A: When RiskGate blocks trading, index derivative execution is strictly blocked."""
     service, feed, ledger, current_time = _make_service(tmp_path, vix=42.0)
     service.auto_enabled = True
 
     mock_adapter = MagicMock()
     mock_adapter.get_candles.return_value = {
-        'chart': _generate_valid_candles(2500.0, 30, base_time=current_time - timedelta(minutes=150)),
+        'chart': _generate_valid_candles(25000.0, 30, base_time=current_time - timedelta(minutes=150)),
         'source': 'DEMO_SYNTHETIC'
     }
 
-    candidate = _make_candidate("RELIANCE", 2500.0)
+    candidate = _make_candidate("NIFTY", 25000.0, is_index=True)
     eval_res = ScanEvaluationResult(
-        symbol="RELIANCE",
-        underlying="RELIANCE",
-        spot_price=2500.0,
+        symbol="NIFTY",
+        underlying="NIFTY",
+        spot_price=25000.0,
         state=SetupState.TRIGGERED,
         bias=MarketBias.BULLISH,
         reason="Breakout detected",
         candidate=candidate,
     )
 
+    def mock_eval(sym, *args, **kwargs):
+        if sym == "NIFTY":
+            return eval_res
+        return ScanEvaluationResult(
+            symbol=sym, underlying=sym, spot_price=2500.0,
+            state=SetupState.NO_SETUP, bias=MarketBias.NEUTRAL,
+            reason="no setup", candidate=None,
+        )
+
     with patch('tradingagents.runtime.market_adapter.get_active_market_adapter', return_value=mock_adapter), \
-         patch.object(service.fo_scanner, 'evaluate_price_action', return_value=eval_res), \
+         patch.object(service.fo_scanner, 'evaluate_price_action', side_effect=mock_eval), \
          patch.object(service.fo_orchestrator, 'process_signal') as mock_process:
         result = service.tick()
 
@@ -135,9 +144,9 @@ def test_a_risk_blocked_cycle_runs_discovery_without_execution(tmp_path):
     assert service.last_scanner_result['universe_count'] == 2
     assert service.last_scanner_result['screened_count'] >= 1
     assert len(service.last_scanner_result['active_candidates']) >= 1
-    assert service.last_scanner_result['execution_allowed'] is False
+    assert service.last_scanner_result['index_execution_allowed'] is False
 
-    # 3. Execution was strictly blocked: process_signal NEVER called, no paper positions
+    # 3. Index execution was strictly blocked: process_signal NEVER called, no paper positions
     assert mock_process.call_count == 0
     assert len(service.fo_orchestrator.paper_engine.get_open_positions()) == 0
 
@@ -232,7 +241,7 @@ def test_c_normal_risk_allowed_execution_path_behaves_as_before(tmp_path):
 
 
 def test_d_engine_graph_factory_mode_runs_discovery_on_risk_blocked_cycle(tmp_path):
-    """Test D: --engine / graph_factory mode allows discovery-only scanning on risk-blocked cycle."""
+    """Test D: --engine / graph_factory mode strictly blocks index execution on risk-blocked cycle."""
     mock_graph = MagicMock()
     service, feed, ledger, current_time = _make_service(
         tmp_path,
@@ -245,11 +254,55 @@ def test_d_engine_graph_factory_mode_runs_discovery_on_risk_blocked_cycle(tmp_pa
 
     mock_adapter = MagicMock()
     mock_adapter.get_candles.return_value = {
+        'chart': _generate_valid_candles(25000.0, 30, base_time=current_time - timedelta(minutes=150)),
+        'source': 'DEMO_SYNTHETIC'
+    }
+
+    candidate = _make_candidate("NIFTY", 25000.0, is_index=True)
+    eval_res = ScanEvaluationResult(
+        symbol="NIFTY",
+        underlying="NIFTY",
+        spot_price=25000.0,
+        state=SetupState.TRIGGERED,
+        bias=MarketBias.BULLISH,
+        reason="Breakout detected",
+        candidate=candidate,
+    )
+
+    def mock_eval(sym, *args, **kwargs):
+        if sym == "NIFTY":
+            return eval_res
+        return ScanEvaluationResult(
+            symbol=sym, underlying=sym, spot_price=2500.0,
+            state=SetupState.NO_SETUP, bias=MarketBias.NEUTRAL,
+            reason="no setup", candidate=None,
+        )
+
+    with patch('tradingagents.runtime.market_adapter.get_active_market_adapter', return_value=mock_adapter), \
+         patch.object(service.fo_scanner, 'evaluate_price_action', side_effect=mock_eval), \
+         patch.object(service.fo_orchestrator, 'process_signal') as mock_process:
+        result = service.tick()
+
+    assert result['status'] == 'risk_blocked'
+    assert service.last_scanner_result['screened_count'] >= 1
+    assert len(service.last_scanner_result['active_candidates']) >= 1
+    assert service.last_scanner_result['index_execution_allowed'] is False
+    assert mock_process.call_count == 0
+    # AI auto mode must NOT be accidentally enabled
+    assert service.auto_enabled is False
+
+
+def test_f_stock_fo_can_execute_when_index_risk_blocked(tmp_path):
+    """Test F: When index risk is blocked, strong individual stock F&O can execute paper trade."""
+    service, feed, ledger, current_time = _make_service(tmp_path, vix=42.0)
+
+    mock_adapter = MagicMock()
+    mock_adapter.get_candles.return_value = {
         'chart': _generate_valid_candles(2500.0, 30, base_time=current_time - timedelta(minutes=150)),
         'source': 'DEMO_SYNTHETIC'
     }
 
-    candidate = _make_candidate("RELIANCE", 2500.0)
+    candidate = _make_candidate("RELIANCE", 2500.0, is_index=False)
     eval_res = ScanEvaluationResult(
         symbol="RELIANCE",
         underlying="RELIANCE",
@@ -260,18 +313,21 @@ def test_d_engine_graph_factory_mode_runs_discovery_on_risk_blocked_cycle(tmp_pa
         candidate=candidate,
     )
 
+    pipe_res = MagicMock()
+    pipe_res.success = True
+    pipe_res.contract.trading_symbol = "RELIANCE26SEP2500CE"
+
     with patch('tradingagents.runtime.market_adapter.get_active_market_adapter', return_value=mock_adapter), \
          patch.object(service.fo_scanner, 'evaluate_price_action', return_value=eval_res), \
-         patch.object(service.fo_orchestrator, 'process_signal') as mock_process:
+         patch.object(service.fo_orchestrator, 'process_signal', return_value=pipe_res) as mock_process:
         result = service.tick()
 
-    assert result['status'] == 'risk_blocked'
-    assert service.last_scanner_result['screened_count'] >= 1
-    assert len(service.last_scanner_result['active_candidates']) >= 1
-    assert service.last_scanner_result['execution_allowed'] is False
-    assert mock_process.call_count == 0
-    # AI auto mode must NOT be accidentally enabled
-    assert service.auto_enabled is False
+    # Stock F&O must execute even though index risk is blocked
+    assert mock_process.call_count == 1
+    assert result['status'] == 'executed_intraday_fo_paper'
+    assert result['contract'] == "RELIANCE26SEP2500CE"
+    assert service.last_scanner_result['execution_allowed'] is True
+    assert service.last_scanner_result['index_execution_allowed'] is False
 
 
 def test_e_protective_exits_daily_loss_closing_window_emergency_stop_preserved(tmp_path):

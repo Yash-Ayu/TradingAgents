@@ -43,6 +43,44 @@ def _parse_candle_timestamp(ts_val: Any) -> datetime | None:
     return None
 
 
+TRANSIENT_MARKET_DATA_ERRORS = {
+    'candle_gap',
+    'insufficient_completed_candles',
+    'candles_not_strictly_ordered',
+    'future_candle',
+    'stale_market_data',
+    'stale_data',
+    'stale_or_future_market_data',
+    'quote_fetch_incomplete',
+    'angel_rate_limited',
+    'angel_timeout',
+    'angel_connection_error',
+    'angel_request_failed',
+    'angel_data_missing',
+    'invalid_quote_timestamp',
+    'quote_timestamp_missing',
+    'RateLimitExceeded',
+    'TimeoutError',
+    'ConnectionError',
+}
+
+
+def is_transient_market_error(reason: str, exc: Exception | None = None) -> bool:
+    """Classify broker-feed and market data gaps that should backoff rather than kill the runner."""
+    if reason in TRANSIENT_MARKET_DATA_ERRORS:
+        return True
+    lower = reason.lower()
+    if any(k in lower for k in ('candle', 'stale', 'rate_limit', 'timeout', 'connection', 'network')):
+        return True
+    if exc is not None:
+        exc_name = type(exc).__name__
+        if exc_name in ('TimeoutError', 'ConnectionError', 'RateLimitExceeded'):
+            return True
+        if any(k in exc_name.lower() for k in ('timeout', 'connection', 'ratelimit', 'network')):
+            return True
+    return False
+
+
 class PaperTradingService:
     def __init__(self, feed, ledger, *, graph_factory=None, analysis_symbol=None,
                  calendar=None, interval=60, max_errors=3, max_order_value=10000,
@@ -82,6 +120,7 @@ class PaperTradingService:
         self.running = False
         self.generation = 0
         self.errors = 0
+        self.non_transient_errors = 0
         self.last_error = None
         self.last_snapshot = None
         self.last_result = {'status': 'stopped'}
@@ -136,6 +175,7 @@ class PaperTradingService:
             self.running = True
             self.generation += 1
             self.errors = 0
+            self.non_transient_errors = 0
             self.last_error = None
             self.stop_event.clear()
             self.ledger.record(self._stamp(), 'started', {'source': self.feed.source, 'mode': 'paper'})
@@ -168,6 +208,8 @@ class PaperTradingService:
 
     def reset_stop(self):
         with self.lock:
+            if self.thread and self.thread.is_alive() and self.stop_event.is_set():
+                self.thread.join(timeout=0.5)
             if self.running or (self.thread and self.thread.is_alive()):
                 raise ValueError('stop_worker_before_reset')
             self.ledger.kill(False, self._stamp())
@@ -236,28 +278,48 @@ class PaperTradingService:
             if protection_exit:
                 result = self._commit(snapshot, generation, 'Sell', flatten=True)
                 result['exit_reason'] = 'protective_stop_or_target'
-            elif not risk['allow_trade'] or closing:
-                if (risk.get('flatten_positions') or closing) and account['positions']:
+            elif closing:
+                if account['positions']:
                     result = self._commit(snapshot, generation, 'Sell', flatten=True)
                 else:
-                    if not closing and not risk['allow_trade']:
-                        self._sync_fo_positions(snapshot)
-                        self._scan_and_execute_fo(snapshot, account, generation, allow_execution=False)
-                    result = {'status': 'risk_blocked' if not risk['allow_trade'] else 'closing_window',
-                            'reasons': risk['reasons']}
+                    result = {'status': 'closing_window', 'reasons': ['Market is closing']}
+            elif (risk.get('flatten_positions') and account['positions']):
+                result = self._commit(snapshot, generation, 'Sell', flatten=True)
+            elif not risk['allow_trade']:
+                # Broad index reference risk is blocked (e.g. NIFTY weak / choppy / high VIX).
+                # Index derivatives cannot execute, but strong individual stock F&O and BTST setups CAN execute!
+                hard_stop = (
+                    account['daily_loss_pct'] >= self.daily_loss_limit
+                    or self.ledger.killed()
+                    or getattr(self.fo_orchestrator.risk_engine, 'is_kill_switched', False)
+                )
+                fo_result = self._scan_and_execute_fo(
+                    snapshot, account, generation,
+                    allow_execution=not hard_stop,
+                    allow_index_execution=False
+                )
+                result = fo_result or {'status': 'risk_blocked', 'reasons': risk['reasons']}
             elif self.auto_enabled:
                 result = self._auto_tick(snapshot, account, generation)
             elif self.graph_factory is None:
                 result = {'status': 'monitoring', 'reason': 'engine_not_configured'}
             else:
-                if self.graph is None:
-                    self.graph = self.graph_factory()
-                _, signal = self.graph.propagate(self.analysis_symbol or self.instrument.symbol,
-                                                now.date().isoformat(), asset_type='stock')
-                self.last_decision = str(signal)
-                result = self._commit(snapshot, generation, signal)
+                fo_result = self._scan_and_execute_fo(snapshot, account, generation, allow_execution=True, allow_index_execution=True)
+                if fo_result:
+                    result = fo_result
+                else:
+                    if self.graph is None:
+                        self.graph = self.graph_factory()
+                    _, signal = self.graph.propagate(self.analysis_symbol or self.instrument.symbol,
+                                                    now.date().isoformat(), asset_type='stock')
+                    self.last_decision = str(signal)
+                    result = self._commit(snapshot, generation, signal)
+
+            if not self.fo_orchestrator.paper_engine.get_open_positions():
+                self.fo_orchestrator.paper_engine.mark_positions_unknown_data(False)
             with self.lock:
                 self.errors = 0
+                self.non_transient_errors = 0
                 self.last_error = None
                 self.last_result = result
                 self.ledger.record(self._stamp(), 'cycle', {
@@ -268,15 +330,21 @@ class PaperTradingService:
         except Exception as exc:
             # SDK/provider messages may contain secrets; only expose safe reason codes.
             reason = str(exc) if type(exc) is ValueError and re.fullmatch('[a-z_]{1,80}', str(exc)) else type(exc).__name__
+            is_transient = is_transient_market_error(reason, exc)
+            self.fo_orchestrator.paper_engine.mark_positions_unknown_data(True)
             with self.lock:
                 self.errors += 1
                 self.last_error = reason
                 self.last_risk = {'risk_state': 'unknown', 'allow_trade': False, 'reasons': [reason]}
                 self.last_result = {'status': 'error', 'reason': reason}
-                self.ledger.record(self._stamp(), 'cycle_error', {'reason': reason, 'count': self.errors})
-                if self.errors >= self.max_errors:
-                    self.running = False
-                    self.stop_event.set()
+                self.ledger.record(self._stamp(), 'cycle_error', {
+                    'reason': reason, 'count': self.errors, 'transient': is_transient
+                })
+                if not is_transient:
+                    self.non_transient_errors += 1
+                    if self.non_transient_errors >= self.max_errors:
+                        self.running = False
+                        self.stop_event.set()
             return self.last_result
         finally:
             self.cycle_lock.release()
@@ -314,8 +382,42 @@ class PaperTradingService:
     def _sync_fo_positions(self, snapshot):
         for pos in self.fo_orchestrator.paper_engine.get_open_positions():
             sym = pos.symbol
-            ltp = snapshot['price'] if sym == self.instrument.symbol else pos.current_mark
-            self.fo_orchestrator.paper_engine.update_mark_price(sym, ltp)
+            ltp = None
+            is_real_quote = False
+
+            # 1. Check live WebSocket market data provider tick
+            if self.fo_orchestrator.market_data_provider is not None:
+                token = getattr(pos.contract, 'symbol_token', None)
+                if token:
+                    tick = self.fo_orchestrator.market_data_provider.get_latest_tick(token)
+                    if tick and not tick.is_stale and tick.ltp > 0:
+                        ltp = tick.ltp
+                        is_real_quote = True
+
+            # 2. Try market adapter quote snapshot for option symbol
+            if ltp is None:
+                try:
+                    from .market_adapter import get_active_market_adapter
+                    adapter = get_active_market_adapter()
+                    if adapter and hasattr(adapter, 'get_quote'):
+                        quote = adapter.get_quote(sym)
+                        if quote and quote.get('ltp'):
+                            candidate_ltp = float(quote['ltp'])
+                            if candidate_ltp > 0 and not quote.get('is_stale', False):
+                                ltp = candidate_ltp
+                                is_real_quote = True
+                except Exception:
+                    pass
+
+            if is_real_quote and ltp is not None and ltp > 0:
+                # Real option tick/quote data received: resume exits and evaluate SL/Target triggers
+                self.fo_orchestrator.paper_engine.mark_positions_unknown_data(False, symbol=sym)
+                self.fo_orchestrator.paper_engine.update_mark_price(sym, ltp)
+            else:
+                # Real option quote unavailable or stale:
+                # Do NOT use synthetic intrinsic/time-decay estimate to trigger SL/Target!
+                # Mark position data as unknown/stale and fail closed until reliable option price returns.
+                self.fo_orchestrator.paper_engine.mark_positions_unknown_data(True, symbol=sym)
 
     def _validate_symbol_candles(self, sym: str, df: pd.DataFrame, source: str, now: datetime) -> tuple[bool, str]:
         """Strict data quality, freshness, and sanity checks for per-symbol candles."""
@@ -371,9 +473,12 @@ class PaperTradingService:
 
         return True, "valid"
 
-    def _scan_and_execute_fo(self, snapshot, account, generation, allow_execution=True):
+    def _scan_and_execute_fo(self, snapshot, account, generation, allow_execution=True, allow_index_execution=True):
         start_time = time.monotonic()
         now = timestamp(self.clock())
+
+        # Always sync existing open F&O positions before scanning new setups
+        self._sync_fo_positions(snapshot)
 
         # Ensure orchestrator and scanner share authoritative scrip master
         self.fo_scanner.scrip_master = self.scrip_master
@@ -402,6 +507,7 @@ class PaperTradingService:
                 'data_source': self.feed.source,
                 'evaluations': [],
                 'execution_allowed': bool(allow_execution),
+                'index_execution_allowed': bool(allow_index_execution),
             }
             return None
 
@@ -539,6 +645,7 @@ class PaperTradingService:
         for sym, df, _spot_price in shortlisted_items:
             scanner_evaluated_count += 1
             is_index = fo_universe.get(sym, {}).get('is_index', False)
+            can_execute = allow_execution and (allow_index_execution or not is_index)
 
             # 4a. BTST Evaluation if in window
             if in_btst:
@@ -546,7 +653,7 @@ class PaperTradingService:
                     btst_res = self.btst_engine.evaluate_btst_candidate(sym, df, eval_time=now)
                     if btst_res.candidate is not None:
                         btst_candidates.append(btst_res.candidate)
-                        if allow_execution and not executed_result and len(self.fo_orchestrator.paper_engine.get_open_positions()) < self.fo_orchestrator.risk_engine.config.max_open_positions:
+                        if can_execute and not executed_result and len(self.fo_orchestrator.paper_engine.get_open_positions()) < self.fo_orchestrator.risk_engine.config.max_open_positions:
                             contract_budget = min(account['cash'], self.max_order_value)
                             est_prem = max(10.0, btst_res.candidate.spot_price * 0.015)
                             lot_size = fo_universe.get(sym, {}).get('lot_size', 50)
@@ -579,7 +686,7 @@ class PaperTradingService:
                 evaluations.append(res)
                 if res.candidate is not None:
                     scanned_candidates.append(res.candidate)
-                    if allow_execution and not executed_result and len(self.fo_orchestrator.paper_engine.get_open_positions()) < self.fo_orchestrator.risk_engine.config.max_open_positions:
+                    if can_execute and not executed_result and len(self.fo_orchestrator.paper_engine.get_open_positions()) < self.fo_orchestrator.risk_engine.config.max_open_positions:
                         contract_budget = min(account['cash'], self.max_order_value)
                         est_prem = max(10.0, res.candidate.spot_price * 0.015)
                         lot_size = fo_universe.get(sym, {}).get('lot_size', 50)
@@ -637,6 +744,7 @@ class PaperTradingService:
             'data_source': self.feed.source,
             'evaluations': [{'symbol': e.symbol, 'state': e.state.value if hasattr(e.state, 'value') else str(e.state), 'reason': e.reason} for e in evaluations],
             'execution_allowed': bool(allow_execution),
+            'index_execution_allowed': bool(allow_index_execution),
         }
 
         if executed_result:

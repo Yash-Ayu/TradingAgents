@@ -30,6 +30,7 @@ class RiskConfig(BaseModel):
     max_bid_ask_spread_pct: float = Field(default=3.0, gt=0, description="Max allowed bid-ask spread in %")
     enforce_market_hours: bool = Field(default=True, description="Enforce strict IST market hours checks")
     enforce_stop_loss: bool = Field(default=True, description="Strictly require valid stop loss for every trade")
+    enforce_target: bool = Field(default=False, description="Strictly require valid target for every trade")
 
 
 class RiskEvaluationRequest(BaseModel):
@@ -92,6 +93,11 @@ class DeterministicRiskEngine:
         self.is_emergency_locked = False
         self.lock_reason = None
         logger.warning(f"Emergency kill switch released. Reason: {reason}")
+
+    @property
+    def is_kill_switched(self) -> bool:
+        """Convenience property for kill switch state."""
+        return self.is_emergency_locked
 
     def evaluate(self, request: RiskEvaluationRequest) -> RiskEvaluationResult:
         """
@@ -234,6 +240,21 @@ class DeterministicRiskEngine:
                     reason=f"Max loss risk (₹{max_loss_risk:.2f}) exceeds allowable limit per trade (₹{self.config.max_loss_per_trade:.2f}).",
                     violation_code="EXCEEDS_MAX_LOSS_PER_TRADE",
                 )
+
+        # 11. TARGET VALIDATION
+        if request.target is not None:
+            if request.action == "BUY" and request.target <= request.entry_price:
+                return RiskEvaluationResult(
+                    approved=False,
+                    reason=f"Invalid target for BUY: Target (₹{request.target}) must be strictly above entry (₹{request.entry_price}).",
+                    violation_code="INVALID_TARGET",
+                )
+        elif self.config.enforce_target:
+            return RiskEvaluationResult(
+                approved=False,
+                reason="Mandatory target missing or invalid. Trade rejected by risk engine.",
+                violation_code="MISSING_TARGET",
+            )
 
         # ALL CHECKS PASSED -> APPROVE TRADE
         return RiskEvaluationResult(

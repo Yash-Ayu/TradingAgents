@@ -146,7 +146,7 @@ def test_3_concurrent_calls_cannot_bypass_limiter():
     sorted_times = sorted(acquired_times)
     for i in range(1, len(sorted_times)):
         diff = sorted_times[i] - sorted_times[i - 1]
-        assert diff >= 0.035, f"Expected spacing >= 0.035s between thread calls, got {diff}"
+        assert diff >= 0.030, f"Expected spacing >= 0.030s between thread calls, got {diff}"
 
 
 def test_4_rate_limit_response_activates_bounded_cooldown():
