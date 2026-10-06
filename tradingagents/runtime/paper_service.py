@@ -133,6 +133,8 @@ class PaperTradingService:
         self.btst_engine = BTSTStrategyEngine()
         self.scanner_batch_size = max(1, int(scanner_batch_size))
         self._scanner_rotation_idx = 0
+        self._scanner_interval_sec = 300.0
+        self._last_scanner_run_mono = 0.0
         self.last_scanner_result: dict = {
             'universe_count': 0,
             'screened_count': 0,
@@ -328,6 +330,17 @@ class PaperTradingService:
                 })
             return result
         except Exception as exc:
+            # Log exception location only, never SDK/provider messages or secrets.
+            tb = exc.__traceback__
+            while tb and tb.tb_next:
+                tb = tb.tb_next
+            if tb:
+                logger.warning(
+                    "Cycle diagnostic: exception_type=%s file=%s line=%d",
+                    type(exc).__name__,
+                    tb.tb_frame.f_code.co_filename.rsplit('/', 1)[-1],
+                    tb.tb_lineno,
+                )
             # SDK/provider messages may contain secrets; only expose safe reason codes.
             reason = str(exc) if type(exc) is ValueError and re.fullmatch('[a-z_]{1,80}', str(exc)) else type(exc).__name__
             is_transient = is_transient_market_error(reason, exc)
@@ -475,6 +488,18 @@ class PaperTradingService:
 
     def _scan_and_execute_fo(self, snapshot, account, generation, allow_execution=True, allow_index_execution=True):
         start_time = time.monotonic()
+
+        # 5-minute candles do not need a full F&O universe scan every 60s.
+        # Skip repeated scans until the next scanner interval.
+        if (
+            self._last_scanner_run_mono > 0
+            and start_time - self._last_scanner_run_mono < self._scanner_interval_sec
+        ):
+            return None
+
+        # Reserve this scan slot before any broker requests so failures/rate
+        # limits cannot cause another full scan on the very next service cycle.
+        self._last_scanner_run_mono = start_time
         now = timestamp(self.clock())
 
         # Always sync existing open F&O positions before scanning new setups
@@ -607,6 +632,13 @@ class PaperTradingService:
                         else:
                             df = None
                 except Exception as exc:
+                    if str(exc) == "angel_rate_limited":
+                        logger.warning(
+                            "Angel rate limit encountered while scanning %s; "
+                            "stopping current scanner batch to avoid further API requests.",
+                            sym,
+                        )
+                        break
                     logger.debug(f"Could not retrieve candles for {sym}: {exc}")
                     df = None
 

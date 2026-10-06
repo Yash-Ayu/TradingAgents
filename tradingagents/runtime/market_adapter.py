@@ -239,7 +239,7 @@ class AngelOneMarketAdapter(MarketDataAdapter):
                     logger.warning(
                         f"Angel rate limit: action=getCandleData bucket=candle source=broker_response attempt={attempt_num}"
                     )
-                    limiter.notify_rate_limit()
+                    limiter.notify_rate_limit(bucket=AngelBucket.CANDLE)
                     if not allow_fallback:
                         raise ValueError('angel_rate_limited')
                     logger.warning(f"Angel One candle data rate limited for {symbol}.")
@@ -255,7 +255,7 @@ class AngelOneMarketAdapter(MarketDataAdapter):
                     logger.warning(
                         f"Angel rate limit: action=getCandleData bucket=candle source={src} attempt={attempt_num}"
                     )
-                    limiter.notify_rate_limit()
+                    limiter.notify_rate_limit(bucket=AngelBucket.CANDLE)
                     if not allow_fallback:
                         raise ValueError('angel_rate_limited') from exc
                     logger.warning(f"Angel One candle data rate limited for {symbol}: {exc}.")
@@ -366,7 +366,7 @@ class AngelOneMarketAdapter(MarketDataAdapter):
             logger.warning(
                 "Angel rate limit: action=getMarketData bucket=quote source=broker_response attempt=1"
             )
-            limiter.notify_rate_limit()
+            limiter.notify_rate_limit(bucket=AngelBucket.QUOTE)
             raise ValueError('angel_rate_limited')
 
         # Angel sessions can expire while this long-running service stays alive.
@@ -386,7 +386,7 @@ class AngelOneMarketAdapter(MarketDataAdapter):
                 logger.warning(
                     "Angel rate limit: action=authenticate bucket=auth source=broker_response attempt=1"
                 )
-                limiter.notify_rate_limit()
+                limiter.notify_rate_limit(bucket=AngelBucket.AUTH)
                 raise ValueError('angel_rate_limited')
             if not auth_res.get('status'):
                 raise ValueError(
@@ -398,7 +398,7 @@ class AngelOneMarketAdapter(MarketDataAdapter):
                 logger.warning(
                     "Angel rate limit: action=getMarketData bucket=quote source=broker_response attempt=2"
                 )
-                limiter.notify_rate_limit()
+                limiter.notify_rate_limit(bucket=AngelBucket.QUOTE)
                 raise ValueError('angel_rate_limited')
 
         if not resp or not resp.get('status'):
