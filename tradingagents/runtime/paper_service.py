@@ -343,6 +343,17 @@ class PaperTradingService:
                 })
             return result
         except Exception as exc:
+            # Log exception location only, never SDK/provider messages or secrets.
+            tb = exc.__traceback__
+            while tb and tb.tb_next:
+                tb = tb.tb_next
+            if tb:
+                logger.warning(
+                    "Cycle diagnostic: exception_type=%s file=%s line=%d",
+                    type(exc).__name__,
+                    tb.tb_frame.f_code.co_filename.rsplit('/', 1)[-1],
+                    tb.tb_lineno,
+                )
             # SDK/provider messages may contain secrets; only expose safe reason codes.
             reason = str(exc) if type(exc) is ValueError and re.fullmatch('[a-z_]{1,80}', str(exc)) else type(exc).__name__
             is_transient = is_transient_market_error(reason, exc)
@@ -634,6 +645,13 @@ class PaperTradingService:
                         else:
                             df = None
                 except Exception as exc:
+                    if str(exc) == "angel_rate_limited":
+                        logger.warning(
+                            "Angel rate limit encountered while scanning %s; "
+                            "stopping current scanner batch to avoid further API requests.",
+                            sym,
+                        )
+                        break
                     logger.debug(f"Could not retrieve candles for {sym}: {exc}")
                     df = None
                     exc_str = str(exc).lower()
@@ -999,3 +1017,4 @@ class PaperTradingService:
         # A slow provider may still be unwinding; its daemon cannot commit after stop.
         if not self.thread or not self.thread.is_alive():
             self.ledger.close()
+

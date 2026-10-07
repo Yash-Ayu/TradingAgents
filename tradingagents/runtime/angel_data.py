@@ -99,7 +99,7 @@ class AngelReadOnlyFeed:
                 logger.warning(
                     "Angel rate limit: action=generateSession bucket=auth source=broker_response attempt=1"
                 )
-                self.limiter.notify_rate_limit(self._rate_limit_cooldown_sec)
+                self.limiter.notify_rate_limit(self._rate_limit_cooldown_sec, bucket=AngelBucket.AUTH)
                 raise ValueError('angel_rate_limited') from None
             data = self._data(response)
             if isinstance(data, dict):
@@ -124,7 +124,7 @@ class AngelReadOnlyFeed:
                 logger.warning(
                     f"Angel rate-limit detail: action=generateSession bucket=auth attempt=1 exception_type={exc_type} marker={marker}"
                 )
-                self.limiter.notify_rate_limit(self._rate_limit_cooldown_sec)
+                self.limiter.notify_rate_limit(self._rate_limit_cooldown_sec, bucket=AngelBucket.AUTH)
                 raise ValueError('angel_rate_limited') from None
             if is_transient_network_error(exc):
                 raise ValueError('angel_connection_error') from None
@@ -135,7 +135,7 @@ class AngelReadOnlyFeed:
         bucket = ACTION_BUCKET_MAP.get(action_name, AngelBucket.CANDLE)
         b_name = bucket.value if hasattr(bucket, 'value') else str(bucket)
 
-        if self.limiter.is_in_cooldown() or (time.monotonic() - self._last_rate_limit_time < self._rate_limit_cooldown_sec):
+        if self.limiter.is_in_cooldown(bucket):
             logger.warning(
                 f"Angel rate limit: action={action_name} bucket={b_name} source=proactive_cooldown attempt=0"
             )
@@ -153,7 +153,7 @@ class AngelReadOnlyFeed:
                         logger.warning(
                             f"Angel rate limit: action={action_name} bucket={b_name} source=broker_response attempt={attempt_num}"
                         )
-                        self.limiter.notify_rate_limit(self._rate_limit_cooldown_sec)
+                        self.limiter.notify_rate_limit(self._rate_limit_cooldown_sec, bucket=bucket)
                         raise ValueError('angel_rate_limited')
                     if is_auth_error(res):
                         if not reauthed and attempt < max_retries:
@@ -175,7 +175,7 @@ class AngelReadOnlyFeed:
                     logger.warning(
                         f"Angel rate-limit detail: action={action_name} bucket={b_name} attempt={attempt_num} exception_type={exc_type} marker={marker}"
                     )
-                    self.limiter.notify_rate_limit(self._rate_limit_cooldown_sec)
+                    self.limiter.notify_rate_limit(self._rate_limit_cooldown_sec, bucket=bucket)
                     raise ValueError('angel_rate_limited') from None
                 if is_auth_error(exc):
                     if not reauthed and attempt < max_retries:
@@ -297,8 +297,20 @@ class AngelReadOnlyFeed:
                 positions_resp = self._call_with_retry(lambda: self.client.position(), 'position')
                 book_resp = self._call_with_retry(lambda: self.client.orderBook(), 'orderBook')
                 rms = self._data(rms_resp)
-                positions = self._data(positions_resp)
-                book = self._data(book_resp)
+                positions = (
+                    []
+                    if isinstance(positions_resp, dict)
+                    and positions_resp.get('status') is True
+                    and positions_resp.get('data') is None
+                    else self._data(positions_resp)
+                )
+                book = (
+                    []
+                    if isinstance(book_resp, dict)
+                    and book_resp.get('status') is True
+                    and book_resp.get('data') is None
+                    else self._data(book_resp)
+                )
                 if not isinstance(positions, list) or not isinstance(book, list):
                     raise ValueError('invalid_broker_account_data')
                 account = {
