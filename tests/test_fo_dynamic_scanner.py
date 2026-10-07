@@ -197,6 +197,8 @@ def test_rotation_consecutive_cycles_covers_different_symbols(tmp_path):
         service._scan_and_execute_fo(feed.snapshot(), ledger.account(), generation=1)
         cycle1_stocks = {e['symbol'] for e in service.last_scanner_result['evaluations'] if e['symbol'] != 'NIFTY'}
 
+        # Advance/reset cadence to simulate next scheduled 5-minute cycle
+        service._last_scan_mono = 0.0
         service._scan_and_execute_fo(feed.snapshot(), ledger.account(), generation=2)
         cycle2_stocks = {e['symbol'] for e in service.last_scanner_result['evaluations'] if e['symbol'] != 'NIFTY'}
 
@@ -218,6 +220,7 @@ def test_rotation_eventually_covers_entire_universe(tmp_path):
     all_screened = set()
     with patch('tradingagents.runtime.market_adapter.get_active_market_adapter', return_value=mock_adapter):
         for gen in range(1, 4):  # 3 cycles * 5 per cycle = 15 symbols
+            service._last_scan_mono = 0.0
             service._scan_and_execute_fo(feed.snapshot(), ledger.account(), generation=gen)
             for e in service.last_scanner_result['evaluations']:
                 all_screened.add(e['symbol'])

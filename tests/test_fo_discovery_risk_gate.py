@@ -193,6 +193,9 @@ def test_b_allow_execution_false_directly_blocks_btst_and_intraday(tmp_path):
     btst_eval_res = MagicMock()
     btst_eval_res.candidate = btst_cand
 
+    # Reset cadence window between test stages to test BTST discovery in separate cadence window
+    service._last_scan_mono = 0.0
+
     with patch('tradingagents.runtime.market_adapter.get_active_market_adapter', return_value=mock_adapter), \
          patch.object(service.btst_engine, 'is_in_btst_window', return_value=(True, "Active")), \
          patch.object(service.btst_engine, 'evaluate_btst_candidate', return_value=btst_eval_res), \

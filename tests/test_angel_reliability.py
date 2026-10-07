@@ -511,6 +511,8 @@ def test_12_scanner_batch_rotation_works(tmp_path, test_clock):
         service._scan_and_execute_fo(snapshot, {'cash': 500000.0}, 1)
         first_rot = service._scanner_rotation_idx
 
+        # Advance/reset cadence to simulate next scheduled 5-minute cycle
+        service._last_scan_mono = 0.0
         service._scan_and_execute_fo(snapshot, {'cash': 500000.0}, 2)
         second_rot = service._scanner_rotation_idx
 

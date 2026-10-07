@@ -232,9 +232,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
         ai_handlers = {'/api/ai/configure': self.server.service.ai.configure,
                        '/api/ai/analyze': self.server.service.ai.analyze}
         if self.path in ai_handlers:
-            if self.server.service.graph_factory is not None:
-                self._send(409, {'error': 'cli_engine_active_restart_without_engine_flag'})
-                return
             try:
                 ai_handlers[self.path](body)
                 self._send(200, self.server.service.status())

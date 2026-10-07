@@ -57,6 +57,10 @@ TRANSIENT_MARKET_DATA_ERRORS = {
     'angel_connection_error',
     'angel_request_failed',
     'angel_data_missing',
+    'dhan_rate_limited',
+    'dhan_timeout',
+    'dhan_auth_failed',
+    'dhan_connection_error',
     'invalid_quote_timestamp',
     'quote_timestamp_missing',
     'RateLimitExceeded',
@@ -91,6 +95,11 @@ class PaperTradingService:
         self.graph_factory = graph_factory
         self.graph = None
         self.ai = AIAnalysis()
+        if self.graph_factory is not None:
+            self.ai.graph_builder = lambda config, key: self.graph_factory()
+            self.ai.state = 'ready'
+            self.ai.config = {'engine': 'cli_engine', 'llm_provider': 'cli_engine', 'quick_think_llm': 'cli_engine'}
+            self.ai.progress = 'CLI Engine active. Stock select karke Analyze dabayein.'
         self.auto_enabled = False
         self.last_ai_consumed = None
         self.last_analysis_bar = None
@@ -132,6 +141,8 @@ class PaperTradingService:
         self.fo_scanner = FOScanner(scrip_master=self.scrip_master)
         self.btst_engine = BTSTStrategyEngine()
         self.scanner_batch_size = max(1, int(scanner_batch_size))
+        self.scanner_cadence_seconds = 300.0
+        self._last_scan_mono = 0.0
         self._scanner_rotation_idx = 0
         self.last_scanner_result: dict = {
             'universe_count': 0,
@@ -139,6 +150,9 @@ class PaperTradingService:
             'scanned_count': 0,
             'shortlisted_count': 0,
             'scanner_evaluated_count': 0,
+            'executable_count': 0,
+            'last_execution_rejection': None,
+            'shortlist_telemetry': [],
             'active_candidates': [],
             'rejected_count': 0,
             'data_unavailable_count': 0,
@@ -151,6 +165,7 @@ class PaperTradingService:
             'data_source': self.feed.source,
             'evaluations': [],
             'execution_allowed': False,
+            'index_execution_allowed': False,
         }
         self.last_btst_result: dict = {
             'window_active': False,
@@ -419,7 +434,7 @@ class PaperTradingService:
                 # Mark position data as unknown/stale and fail closed until reliable option price returns.
                 self.fo_orchestrator.paper_engine.mark_positions_unknown_data(True, symbol=sym)
 
-    def _validate_symbol_candles(self, sym: str, df: pd.DataFrame, source: str, now: datetime) -> tuple[bool, str]:
+    def _validate_symbol_candles(self, sym: str, df: pd.DataFrame, source: str, now: datetime, is_index: bool = False) -> tuple[bool, str]:
         """Strict data quality, freshness, and sanity checks for per-symbol candles."""
         if df is None or len(df) < 25:
             return False, f"insufficient_bars_{len(df) if df is not None else 0}"
@@ -454,7 +469,11 @@ class PaperTradingService:
         if recent_range <= 1e-6:
             return False, "flat_dead_feed_zero_range"
 
-        if float(df['Volume'].iloc[-20:].sum()) <= 0:
+        # Volume validation:
+        # For stocks: zero/flat volume remains a hard data-quality failure.
+        # For cash indices (NIFTY, BANKNIFTY, etc.): volume is structurally unavailable (reported as 0),
+        # so validate OHLC movement, range, std, and freshness instead of rejecting as dead feed.
+        if not is_index and float(df['Volume'].iloc[-20:].sum()) <= 0:
             return False, "dead_feed_zero_volume"
 
         # 4. Timestamp & Freshness validation
@@ -473,12 +492,19 @@ class PaperTradingService:
 
         return True, "valid"
 
-    def _scan_and_execute_fo(self, snapshot, account, generation, allow_execution=True, allow_index_execution=True):
+    def _scan_and_execute_fo(self, snapshot, account, generation, allow_execution=True, allow_index_execution=True, force=False):
         start_time = time.monotonic()
         now = timestamp(self.clock())
 
         # Always sync existing open F&O positions before scanning new setups
         self._sync_fo_positions(snapshot)
+
+        now_mono = time.monotonic()
+        if not force and self._last_scan_mono > 0.0 and (now_mono - self._last_scan_mono) < self.scanner_cadence_seconds:
+            logger.debug(f"Scanner cadence active ({(now_mono - self._last_scan_mono):.1f}s < {self.scanner_cadence_seconds}s). Skipping scan.")
+            return None
+
+        self._last_scan_mono = now_mono
 
         # Ensure orchestrator and scanner share authoritative scrip master
         self.fo_scanner.scrip_master = self.scrip_master
@@ -569,6 +595,7 @@ class PaperTradingService:
             screened_count += 1
             df = None
             candle_source = self.feed.source
+            is_index = fo_universe.get(sym, {}).get('is_index', False) or sym in {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "Nifty 50", "Nifty Bank"}
 
             # Guardrail 4: Per-symbol real market data isolation.
             # Never reuse currently selected instrument's snapshot chart for any other symbol.
@@ -609,6 +636,11 @@ class PaperTradingService:
                 except Exception as exc:
                     logger.debug(f"Could not retrieve candles for {sym}: {exc}")
                     df = None
+                    exc_str = str(exc).lower()
+                    if "rate_limit" in exc_str or "ab1004" in exc_str or "429" in exc_str:
+                        logger.warning(f"Angel One rate limit encountered during screening on {sym}. Halting scanner batch immediately.")
+                        rejected_by_reason["RATE_LIMITED"] = rejected_by_reason.get("RATE_LIMITED", 0) + 1
+                        break
 
             # Guardrail 6 & 7: Stale, flat, dead, or missing data validation
             if df is None:
@@ -623,7 +655,7 @@ class PaperTradingService:
                 ))
                 continue
 
-            valid, reason = self._validate_symbol_candles(sym, df, candle_source, now)
+            valid, reason = self._validate_symbol_candles(sym, df, candle_source, now, is_index=is_index)
             if not valid:
                 if "stale" in reason or "missing" in reason or "insufficient" in reason or "timestamp" in reason:
                     data_unavailable_count += 1
@@ -642,10 +674,22 @@ class PaperTradingService:
             shortlisted_items.append((sym, df, latest_price))
 
         # Stage 4: Deeper F&O Scanning / Early-Setup Evaluation / Orchestration
+        shortlist_telemetry = []
+        executable_count = 0
+        last_execution_rejection = None
+
         for sym, df, _spot_price in shortlisted_items:
             scanner_evaluated_count += 1
             is_index = fo_universe.get(sym, {}).get('is_index', False)
             can_execute = allow_execution and (allow_index_execution or not is_index)
+            cand_telemetry = {
+                'symbol': sym,
+                'is_index': is_index,
+                'state': 'UNKNOWN',
+                'setup_name': None,
+                'rejection_reason': None,
+                'execution_status': 'NOT_EXECUTED',
+            }
 
             # 4a. BTST Evaluation if in window
             if in_btst:
@@ -653,6 +697,7 @@ class PaperTradingService:
                     btst_res = self.btst_engine.evaluate_btst_candidate(sym, df, eval_time=now)
                     if btst_res.candidate is not None:
                         btst_candidates.append(btst_res.candidate)
+                        cand_telemetry['setup_name'] = btst_res.candidate.strategy_id
                         if can_execute and not executed_result and len(self.fo_orchestrator.paper_engine.get_open_positions()) < self.fo_orchestrator.risk_engine.config.max_open_positions:
                             contract_budget = min(account['cash'], self.max_order_value)
                             est_prem = max(10.0, btst_res.candidate.spot_price * 0.015)
@@ -677,6 +722,17 @@ class PaperTradingService:
                                     'contract': pipe_res.contract.trading_symbol if pipe_res.contract else sym,
                                     'lots': lots
                                 }
+                                executable_count += 1
+                                cand_telemetry['execution_status'] = 'EXECUTED_BTST'
+                            else:
+                                last_execution_rejection = pipe_res.reason or pipe_res.status
+                                cand_telemetry['rejection_reason'] = last_execution_rejection
+                        elif not can_execute:
+                            cand_telemetry['rejection_reason'] = 'RISK_BLOCKED'
+                            last_execution_rejection = 'RISK_BLOCKED'
+                        elif len(self.fo_orchestrator.paper_engine.get_open_positions()) >= self.fo_orchestrator.risk_engine.config.max_open_positions:
+                            cand_telemetry['rejection_reason'] = 'MAX_OPEN_POSITIONS'
+                            last_execution_rejection = 'MAX_OPEN_POSITIONS'
                 except Exception as exc:
                     logger.warning(f"BTST evaluation failed for {sym}: {exc}")
 
@@ -684,8 +740,10 @@ class PaperTradingService:
             try:
                 res = self.fo_scanner.evaluate_price_action(sym, df, is_index=is_index)
                 evaluations.append(res)
+                cand_telemetry['state'] = res.state.value if hasattr(res.state, 'value') else str(res.state)
                 if res.candidate is not None:
                     scanned_candidates.append(res.candidate)
+                    cand_telemetry['setup_name'] = res.candidate.setup_name
                     if can_execute and not executed_result and len(self.fo_orchestrator.paper_engine.get_open_positions()) < self.fo_orchestrator.risk_engine.config.max_open_positions:
                         contract_budget = min(account['cash'], self.max_order_value)
                         est_prem = max(10.0, res.candidate.spot_price * 0.015)
@@ -710,13 +768,32 @@ class PaperTradingService:
                                 'contract': pipe_res.contract.trading_symbol if pipe_res.contract else sym,
                                 'lots': lots
                             }
+                            executable_count += 1
+                            cand_telemetry['execution_status'] = 'EXECUTED_INTRADAY'
+                        else:
+                            last_execution_rejection = pipe_res.reason or pipe_res.status
+                            cand_telemetry['rejection_reason'] = last_execution_rejection
+                    elif not can_execute:
+                        rej_code = 'INDEX_EXECUTION_BLOCKED' if is_index else 'RISK_BLOCKED'
+                        cand_telemetry['rejection_reason'] = rej_code
+                        last_execution_rejection = rej_code
+                    elif len(self.fo_orchestrator.paper_engine.get_open_positions()) >= self.fo_orchestrator.risk_engine.config.max_open_positions:
+                        cand_telemetry['rejection_reason'] = 'MAX_OPEN_POSITIONS'
+                        last_execution_rejection = 'MAX_OPEN_POSITIONS'
+                    elif executed_result is not None:
+                        cand_telemetry['rejection_reason'] = 'MAX_ONE_TRADE_PER_TICK'
                 else:
                     rejected_count += 1
-                    rejected_by_reason[res.state.value] = rejected_by_reason.get(res.state.value, 0) + 1
+                    rej_code = res.state.value if hasattr(res.state, 'value') else str(res.state)
+                    rejected_by_reason[rej_code] = rejected_by_reason.get(rej_code, 0) + 1
+                    cand_telemetry['rejection_reason'] = rej_code
             except Exception as exc:
                 logger.warning(f"FO Scanner evaluation failed for {sym}: {exc}")
                 rejected_count += 1
                 rejected_by_reason['evaluation_exception'] = rejected_by_reason.get('evaluation_exception', 0) + 1
+                cand_telemetry['rejection_reason'] = 'EVALUATION_EXCEPTION'
+
+            shortlist_telemetry.append(cand_telemetry)
 
         # Finalize and Populate Telemetry BEFORE returning execution result
         scan_duration = round(time.monotonic() - start_time, 4)
@@ -732,6 +809,9 @@ class PaperTradingService:
             'scanned_count': screened_count,
             'shortlisted_count': shortlisted_count,
             'scanner_evaluated_count': scanner_evaluated_count,
+            'executable_count': executable_count,
+            'last_execution_rejection': last_execution_rejection,
+            'shortlist_telemetry': shortlist_telemetry,
             'active_candidates': [c.__dict__ if hasattr(c, '__dict__') else c for c in scanned_candidates],
             'rejected_count': rejected_count,
             'data_unavailable_count': data_unavailable_count,
@@ -856,11 +936,37 @@ class PaperTradingService:
             except ValueError:
                 market_open = False
             risk = copy.deepcopy(self.last_risk)
+            is_stale = False
             if self.last_snapshot:
                 try:
                     self._validate(self.last_snapshot, now)
                 except ValueError:
-                    risk = {'risk_state': 'unknown', 'allow_trade': False, 'reasons': ['Market data is stale']}
+                    is_stale = True
+                    # If risk state was allowed or unspecified, reflect stale data condition
+                    if risk.get('risk_state') in ('normal', 'low', 'unknown'):
+                        risk['allow_trade'] = False
+                        if 'Market data is stale' not in risk.get('reasons', []):
+                            risk['reasons'] = ['Market data is stale'] + [r for r in risk.get('reasons', []) if r != 'Market data is stale']
+
+            market_data_info = {
+                'primary': self.feed.source,
+                'active': self.feed.source,
+                'fallback_active': False,
+                'reason': None,
+                'health': {self.feed.source: 'healthy' if self.feed.connected else 'disconnected'},
+                'last_candle_timestamp': None,
+                'last_quote_timestamp': None,
+            }
+            try:
+                from .market_adapter import get_active_market_adapter
+                adapter = get_active_market_adapter(preferred_source=self.feed.source)
+                if hasattr(adapter, 'get_status'):
+                    market_data_info.update(adapter.get_status())
+                elif hasattr(adapter, 'name'):
+                    market_data_info['active'] = adapter.name
+            except Exception:
+                pass
+
             killed = self.ledger.killed()
             fo_pos = [p.model_dump() for p in self.fo_orchestrator.paper_engine.get_open_positions()]
             fo_orders = self.fo_orchestrator.paper_engine.get_orders(20)
@@ -880,6 +986,9 @@ class PaperTradingService:
                     'fo_positions': fo_pos, 'fo_orders': fo_orders, 'fo_history': fo_history,
                     'fo_metrics': fo_metrics, 'fo_scanner': copy.deepcopy(self.last_scanner_result),
                     'btst': copy.deepcopy(self.last_btst_result),
+                    'market_data': market_data_info,
+                    'is_data_stale': is_stale or bool(risk.get('reasons') and any('stale' in r.lower() for r in risk.get('reasons', []))),
+                    'fallback_active': market_data_info.get('fallback_active', False),
                     **self.ledger.history()}
 
     def close(self):

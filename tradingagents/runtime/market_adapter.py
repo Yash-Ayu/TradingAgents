@@ -18,6 +18,7 @@ import threading
 import time
 from contextlib import suppress
 from datetime import datetime, time as dtime, timedelta
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -148,6 +149,11 @@ class AngelOneMarketAdapter(MarketDataAdapter):
         from tradingagents.integrations.angel_one.market_data import AngelOneMarketDataProvider
         client = self._get_client()
         provider = AngelOneMarketDataProvider(client=client)
+        try:
+            from .local_candle_store import get_local_candle_store
+            provider.register_tick_listener(get_local_candle_store().on_tick)
+        except Exception as exc:
+            logger.debug(f"Could not attach local candle store to tick stream: {exc}")
         provider.connect()
         provider.start_websocket()
         self._provider = provider
@@ -214,8 +220,8 @@ class AngelOneMarketAdapter(MarketDataAdapter):
                 if time.monotonic() - ts < 15:  # 15s cache
                     return cached
 
-        client = self._get_client()
         now = datetime.now(IST)
+        client = self._get_client()
         from_dt = now - delta
 
         # Call official Angel One SmartConnect getCandleData
@@ -239,7 +245,7 @@ class AngelOneMarketAdapter(MarketDataAdapter):
                     logger.warning(
                         f"Angel rate limit: action=getCandleData bucket=candle source=broker_response attempt={attempt_num}"
                     )
-                    limiter.notify_rate_limit()
+                    limiter.notify_rate_limit(action='getCandleData', bucket=AngelBucket.CANDLE, source='broker_response', attempt=attempt_num)
                     if not allow_fallback:
                         raise ValueError('angel_rate_limited')
                     logger.warning(f"Angel One candle data rate limited for {symbol}.")
@@ -255,7 +261,7 @@ class AngelOneMarketAdapter(MarketDataAdapter):
                     logger.warning(
                         f"Angel rate limit: action=getCandleData bucket=candle source={src} attempt={attempt_num}"
                     )
-                    limiter.notify_rate_limit()
+                    limiter.notify_rate_limit(action='getCandleData', bucket=AngelBucket.CANDLE, source=src, attempt=attempt_num)
                     if not allow_fallback:
                         raise ValueError('angel_rate_limited') from exc
                     logger.warning(f"Angel One candle data rate limited for {symbol}: {exc}.")
@@ -294,6 +300,12 @@ class AngelOneMarketAdapter(MarketDataAdapter):
 
         if not rows:
             raise ValueError(f"No valid candles returned for {symbol}")
+
+        try:
+            from .local_candle_store import get_local_candle_store
+            get_local_candle_store().merge_rest_candles(clean, rows, interval=interval)
+        except Exception as exc:
+            logger.debug(f"Error merging REST candles into local store for {clean}: {exc}")
 
         latest_price = rows[-1][4]
         first_open = rows[0][1]
@@ -366,7 +378,7 @@ class AngelOneMarketAdapter(MarketDataAdapter):
             logger.warning(
                 "Angel rate limit: action=getMarketData bucket=quote source=broker_response attempt=1"
             )
-            limiter.notify_rate_limit()
+            limiter.notify_rate_limit(action='getMarketData', bucket=AngelBucket.QUOTE, source='broker_response', attempt=1)
             raise ValueError('angel_rate_limited')
 
         # Angel sessions can expire while this long-running service stays alive.
@@ -386,7 +398,7 @@ class AngelOneMarketAdapter(MarketDataAdapter):
                 logger.warning(
                     "Angel rate limit: action=authenticate bucket=auth source=broker_response attempt=1"
                 )
-                limiter.notify_rate_limit()
+                limiter.notify_rate_limit(action='authenticate', bucket=AngelBucket.AUTH, source='broker_response', attempt=1)
                 raise ValueError('angel_rate_limited')
             if not auth_res.get('status'):
                 raise ValueError(
@@ -398,7 +410,7 @@ class AngelOneMarketAdapter(MarketDataAdapter):
                 logger.warning(
                     "Angel rate limit: action=getMarketData bucket=quote source=broker_response attempt=2"
                 )
-                limiter.notify_rate_limit()
+                limiter.notify_rate_limit(action='getMarketData', bucket=AngelBucket.QUOTE, source='broker_response', attempt=2)
                 raise ValueError('angel_rate_limited')
 
         if not resp or not resp.get('status'):
@@ -515,6 +527,296 @@ class DemoMarketAdapter(MarketDataAdapter):
         }
 
 
+class DhanMarketAdapter(MarketDataAdapter):
+    """Read-only market data adapter for DhanHQ."""
+
+    name: str = 'dhan'
+
+class DhanMarketAdapter(MarketDataAdapter):
+    """DhanHQ Market Data Adapter (Read-Only)."""
+
+    name: str = 'dhan'
+
+    def __init__(self, provider: Any = None):
+        super().__init__()
+        self._provider = provider
+
+    def _get_provider(self):
+        if self._provider is None:
+            from tradingagents.integrations.dhan.market_data import DhanMarketDataProvider
+            self._provider = DhanMarketDataProvider()
+        return self._provider
+
+    def is_configured(self) -> bool:
+        return self._get_provider().is_configured()
+
+    def get_candles(self, symbol: str, interval: str = '5m', **kwargs) -> Dict[str, Any]:
+        if not self.is_configured():
+            raise ValueError("dhan_not_configured")
+        res = self._get_provider().get_candles(symbol, interval=interval)
+        if not res or not res.get('chart'):
+            raise ValueError(f"Dhan candle data empty for {symbol}")
+        return res
+
+    def get_quote(self, symbol: str) -> Dict[str, Any]:
+        if not self.is_configured():
+            raise ValueError("dhan_not_configured")
+        res = self._get_provider().get_quote(symbol)
+        if not res or not res.get('ltp'):
+            raise ValueError(f"Dhan quote unavailable for {symbol}")
+        return res
+
+    def get_status(self) -> Dict[str, Any]:
+        return self._get_provider().get_status()
+
+
+class ProviderHealthState(str, Enum):
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    RATE_LIMITED = "rate_limited"
+    STALE = "stale"
+    DISCONNECTED = "disconnected"
+    NOT_CONFIGURED = "not_configured"
+
+
+class SmartMultiProviderAdapter(MarketDataAdapter):
+    """
+    Intelligent multi-provider adapter that manages primary and fallback market data feeds
+    with configurable priority, health tracking, local candle preference, and hysteresis.
+    """
+
+    name: str = 'smart'
+
+    def __init__(
+        self,
+        primary: Optional[MarketDataAdapter] = None,
+        fallbacks: Optional[List[MarketDataAdapter]] = None,
+        failover_cooldown_sec: float = 60.0,
+    ):
+        super().__init__()
+        primary_env = os.environ.get("MARKET_DATA_PRIMARY", "angel").strip().lower()
+        fb_env = os.environ.get("MARKET_DATA_FALLBACK", "").strip().lower()
+
+        if primary is not None:
+            self.primary = primary
+        elif primary_env in ("dhan", "dhanhq"):
+            self.primary = DhanMarketAdapter()
+        else:
+            self.primary = AngelOneMarketAdapter()
+
+        if fallbacks is not None:
+            self.fallbacks = fallbacks
+        else:
+            default_fbs: List[MarketDataAdapter] = []
+            if fb_env in ("dhan", "dhanhq") and self.primary.name != "dhan":
+                default_fbs.append(DhanMarketAdapter())
+            elif fb_env in ("angel", "angel_one") and self.primary.name != "angel_one":
+                default_fbs.append(AngelOneMarketAdapter())
+            else:
+                # Default opposite provider
+                if self.primary.name == "dhan":
+                    default_fbs.append(AngelOneMarketAdapter())
+                else:
+                    default_fbs.append(DhanMarketAdapter())
+            default_fbs.append(ResearchMarketAdapter())
+            self.fallbacks = default_fbs
+
+        self.failover_cooldown_sec = failover_cooldown_sec
+        self.active_adapter_name: str = self.primary.name
+        self.fallback_active: bool = False
+        self.fallback_reason: Optional[str] = None
+        self._last_failover_mono: float = 0.0
+        self._health: Dict[str, str] = {
+            self.primary.name: ProviderHealthState.HEALTHY.value if self.primary.is_configured() else ProviderHealthState.NOT_CONFIGURED.value,
+        }
+        for fb in self.fallbacks:
+            self._health[fb.name] = ProviderHealthState.HEALTHY.value if fb.is_configured() else ProviderHealthState.NOT_CONFIGURED.value
+        self.last_candle_timestamp: Optional[str] = None
+        self.last_quote_timestamp: Optional[str] = None
+        self._lock = threading.RLock()
+
+    def is_configured(self) -> bool:
+        return self.primary.is_configured() or any(fb.is_configured() for fb in self.fallbacks)
+
+    def resolve_token(self, symbol: str) -> tuple[str, str, str]:
+        if hasattr(self.primary, 'resolve_token'):
+            return self.primary.resolve_token(symbol)
+        for fb in self.fallbacks:
+            if hasattr(fb, 'resolve_token'):
+                return fb.resolve_token(symbol)
+        clean = symbol.strip().upper()
+        if clean in WELL_KNOWN_TOKENS:
+            return WELL_KNOWN_TOKENS[clean]
+        return 'NSE', '0', clean
+
+    def _get_provider(self):
+        if hasattr(self.primary, '_get_provider'):
+            return self.primary._get_provider()
+        for fb in self.fallbacks:
+            if hasattr(fb, '_get_provider'):
+                return fb._get_provider()
+        return None
+
+    def _get_client(self):
+        if hasattr(self.primary, '_get_client'):
+            return self.primary._get_client()
+        for fb in self.fallbacks:
+            if hasattr(fb, '_get_client'):
+                return fb._get_client()
+        return None
+
+    def get_candles(self, symbol: str, interval: str = '5m', allow_fallback: bool = False, **kwargs) -> Dict[str, Any]:
+        with self._lock:
+            # 0. Check LocalCandleStore first if fresh completed bars exist
+            try:
+                from .local_candle_store import get_local_candle_store
+                local_res = get_local_candle_store().get_candles(symbol, interval=interval, min_bars=25, max_age_seconds=900.0)
+                if local_res and len(local_res.get('chart', [])) >= 25:
+                    self.last_candle_timestamp = local_res.get('latest_bar_timestamp')
+                    return local_res
+            except Exception as e:
+                logger.debug(f"Local candle check error: {e}")
+
+            now_mono = time.monotonic()
+            # If currently failed over, check if hysteresis cooldown has elapsed to retry primary
+            if self.fallback_active and (now_mono - self._last_failover_mono > self.failover_cooldown_sec):
+                primary_ready = True
+                if self.primary.name == "angel_one":
+                    limiter = get_angel_rate_limiter()
+                    if limiter.is_in_cooldown(AngelBucket.CANDLE):
+                        primary_ready = False
+                elif self.primary.name == "dhan":
+                    if hasattr(self.primary, "_get_provider"):
+                        p = self.primary._get_provider()
+                        if getattr(p, "state", None) in (ProviderHealthState.RATE_LIMITED.value, "rate_limited", "degraded", "auth_failed"):
+                            primary_ready = False
+                if primary_ready:
+                    self.fallback_active = False
+                    self.active_adapter_name = self.primary.name
+                    self.fallback_reason = None
+
+            # 1. If primary active, try primary
+            if not self.fallback_active:
+                try:
+                    res = self.primary.get_candles(symbol, interval=interval, allow_fallback=False, **kwargs)
+                    self._health[self.primary.name] = ProviderHealthState.HEALTHY.value
+                    self.last_candle_timestamp = res.get('timestamp')
+                    # Backfill into local candle store
+                    try:
+                        from .local_candle_store import get_local_candle_store
+                        get_local_candle_store().merge_rest_candles(symbol, res.get('chart', []), interval=interval)
+                    except Exception:
+                        pass
+                    return res
+                except Exception as exc:
+                    exc_str = str(exc)
+                    is_rl = 'rate_limited' in exc_str or 'ab1004' in exc_str.lower()
+                    self._health[self.primary.name] = ProviderHealthState.RATE_LIMITED.value if is_rl else ProviderHealthState.DEGRADED.value
+
+                    if not allow_fallback:
+                        raise
+
+                    # Try fallbacks in configured order
+                    for fb in self.fallbacks:
+                        if fb.is_configured():
+                            try:
+                                fb_res = fb.get_candles(symbol, interval=interval, **kwargs)
+                                if fb_res and fb_res.get('chart'):
+                                    self.fallback_active = True
+                                    self.active_adapter_name = fb.name
+                                    self.fallback_reason = "angel_rate_limited" if (is_rl and "angel" in self.primary.name) else (f"{self.primary.name}_rate_limited" if is_rl else f"primary_failed: {type(exc).__name__}")
+                                    self._last_failover_mono = now_mono
+                                    self._health[fb.name] = ProviderHealthState.HEALTHY.value
+                                    fb_res['is_fallback'] = True
+                                    fb_res['fallback_reason'] = self.fallback_reason
+                                    self.last_candle_timestamp = fb_res.get('timestamp')
+                                    # Backfill into local candle store
+                                    try:
+                                        from .local_candle_store import get_local_candle_store
+                                        get_local_candle_store().merge_rest_candles(symbol, fb_res.get('chart', []), interval=interval)
+                                    except Exception:
+                                        pass
+                                    return fb_res
+                            except Exception as fb_exc:
+                                self._health[fb.name] = ProviderHealthState.DEGRADED.value
+                                logger.debug(f"Fallback {fb.name} failed for {symbol}: {fb_exc}")
+
+                    # If no reliable provider => fail closed
+                    raise
+
+            # 2. If fallback currently active
+            for fb in self.fallbacks:
+                if fb.name == self.active_adapter_name and fb.is_configured():
+                    try:
+                        fb_res = fb.get_candles(symbol, interval=interval, **kwargs)
+                        if fb_res and fb_res.get('chart'):
+                            fb_res['is_fallback'] = True
+                            fb_res['fallback_reason'] = self.fallback_reason
+                            self.last_candle_timestamp = fb_res.get('timestamp')
+                            return fb_res
+                    except Exception as fb_exc:
+                        self._health[fb.name] = ProviderHealthState.DEGRADED.value
+
+            # If active fallback failed, re-try primary
+            return self.primary.get_candles(symbol, interval=interval, allow_fallback=allow_fallback, **kwargs)
+
+    def get_quote(self, symbol: str) -> Dict[str, Any]:
+        with self._lock:
+            # 1. Try primary
+            try:
+                res = self.primary.get_quote(symbol)
+                self._health[self.primary.name] = ProviderHealthState.HEALTHY.value
+                self.last_quote_timestamp = res.get('timestamp')
+                return res
+            except Exception as exc:
+                exc_str = str(exc)
+                is_rl = 'rate_limited' in exc_str
+                self._health[self.primary.name] = ProviderHealthState.RATE_LIMITED.value if is_rl else ProviderHealthState.DEGRADED.value
+
+                # Try fallbacks
+                for fb in self.fallbacks:
+                    if fb.is_configured():
+                        try:
+                            fb_res = fb.get_quote(symbol)
+                            if fb_res and fb_res.get('ltp'):
+                                self._health[fb.name] = ProviderHealthState.HEALTHY.value
+                                self.last_quote_timestamp = fb_res.get('timestamp')
+                                return fb_res
+                        except Exception:
+                            self._health[fb.name] = ProviderHealthState.DEGRADED.value
+                raise
+
+    def get_status(self) -> Dict[str, Any]:
+        local_candle_health = "unknown"
+        try:
+            from .local_candle_store import get_local_candle_store
+            store = get_local_candle_store()
+            local_candle_health = "healthy" if len(store._bars_5m) > 0 or len(store._bars_1m) > 0 else "empty"
+        except Exception:
+            local_candle_health = "unavailable"
+
+        dhan_token_state = None
+        try:
+            from tradingagents.integrations.dhan.auth import get_dhan_token_manager
+            dhan_token_state = get_dhan_token_manager().get_status()
+        except Exception:
+            pass
+
+        return {
+            'primary': self.primary.name,
+            'active': self.active_adapter_name,
+            'fallback_active': self.fallback_active,
+            'reason': self.fallback_reason,
+            'health': dict(self._health),
+            'angel_health': self._health.get('angel_one', 'unknown'),
+            'dhan_health': self._health.get('dhan', 'unknown'),
+            'local_candle_health': local_candle_health,
+            'last_candle_timestamp': self.last_candle_timestamp,
+            'last_quote_timestamp': self.last_quote_timestamp,
+            'token_state': dhan_token_state,
+        }
+
+
 _ACTIVE_ADAPTER: Optional[MarketDataAdapter] = None
 _ADAPTER_LOCK = threading.Lock()
 
@@ -527,9 +829,23 @@ def get_active_market_adapter(preferred_source: Optional[str] = None) -> MarketD
             return DemoMarketAdapter()
         if preferred_source == 'research':
             return ResearchMarketAdapter()
+        if preferred_source == 'dhan':
+            return DhanMarketAdapter()
+        if preferred_source in ('angel_one', 'angel'):
+            angel = AngelOneMarketAdapter()
+            return angel
 
-        if _ACTIVE_ADAPTER is not None and (_ACTIVE_ADAPTER.name == 'angel_one' or preferred_source is None):
+        if _ACTIVE_ADAPTER is not None and (_ACTIVE_ADAPTER.name in ('angel_one', 'dhan', 'smart') or preferred_source is None):
             return _ACTIVE_ADAPTER
+
+        # Check configured primary provider from environment
+        primary_env = os.environ.get("MARKET_DATA_PRIMARY", "").strip().lower()
+        if primary_env in ("dhan", "dhanhq"):
+            dhan = DhanMarketAdapter()
+            if dhan.is_configured():
+                angel = AngelOneMarketAdapter()
+                _ACTIVE_ADAPTER = SmartMultiProviderAdapter(primary=dhan, fallbacks=[angel, ResearchMarketAdapter()])
+                return _ACTIVE_ADAPTER
 
         # Check Angel One
         angel = AngelOneMarketAdapter()
@@ -537,10 +853,17 @@ def get_active_market_adapter(preferred_source: Optional[str] = None) -> MarketD
             try:
                 # Test connectivity
                 angel._get_client()
-                _ACTIVE_ADAPTER = angel
-                return angel
+                dhan = DhanMarketAdapter()
+                _ACTIVE_ADAPTER = SmartMultiProviderAdapter(primary=angel, fallbacks=[dhan, ResearchMarketAdapter()])
+                return _ACTIVE_ADAPTER
             except Exception as e:
-                logger.warning(f"Angel One credentials present but init failed: {e}. Falling back to ResearchAdapter.")
+                logger.warning(f"Angel One credentials present but init failed: {e}. Checking Dhan fallback.")
+
+        # Check Dhan if Angel One failed or unconfigured
+        dhan = DhanMarketAdapter()
+        if dhan.is_configured():
+            _ACTIVE_ADAPTER = SmartMultiProviderAdapter(primary=dhan, fallbacks=[AngelOneMarketAdapter(), ResearchMarketAdapter()])
+            return _ACTIVE_ADAPTER
 
         # Default fallback
         _ACTIVE_ADAPTER = ResearchMarketAdapter()

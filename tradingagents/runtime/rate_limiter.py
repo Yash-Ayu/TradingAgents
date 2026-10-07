@@ -41,6 +41,7 @@ class EndpointBucket:
         self.name = name
         self.min_interval = min_interval
         self.last_scheduled: float = 0.0
+        self.cooldown_until: float = 0.0
 
 
 class AngelRateLimitTimeout(ValueError):
@@ -141,14 +142,17 @@ class AngelRateLimiter:
         with self._lock:
             now = self.time_fn()
 
+            target_bucket = self._buckets[b_key]
+            effective_cooldown = max(self._cooldown_until, target_bucket.cooldown_until)
+
             # 1. Reactive cooldown handling
-            if now < self._cooldown_until:
+            if now < effective_cooldown:
                 if not block_on_cooldown:
                     logger.warning(
                         f"Angel rate limit: action=acquire bucket={b_key} source=proactive_cooldown attempt=0"
                     )
                     raise ValueError("angel_rate_limited")
-                cooldown_wait = self._cooldown_until - now
+                cooldown_wait = effective_cooldown - now
                 if cooldown_wait > timeout:
                     logger.warning(
                         f"Angel rate limit: action=acquire bucket={b_key} source=proactive_timeout attempt=0"
@@ -157,8 +161,6 @@ class AngelRateLimiter:
                         f"angel_rate_limited: cooldown wait {cooldown_wait:.2f}s exceeds timeout {timeout:.2f}s"
                     )
 
-            target_bucket = self._buckets[b_key]
-
             # 2. Determine earliest scheduled slot for this bucket
             earliest_bucket = max(now, target_bucket.last_scheduled + target_bucket.min_interval)
 
@@ -166,7 +168,7 @@ class AngelRateLimiter:
             earliest_global = max(now, self._last_dispatch_time + self.global_min_interval)
 
             # 4. Respect cooldown if active
-            scheduled_time = max(earliest_bucket, earliest_global, self._cooldown_until)
+            scheduled_time = max(earliest_bucket, earliest_global, effective_cooldown)
 
             wait_duration = scheduled_time - now
             if wait_duration > timeout:
@@ -197,12 +199,18 @@ class AngelRateLimiter:
     ) -> None:
         """Notifies the limiter that upstream Angel One returned a rate limit response (429 / AB1004).
 
-        Activates reactive cooldown across all buckets to prevent hammer-retries.
+        Activates reactive cooldown for the target bucket (or globally if unspecified).
         """
         cd = cooldown_sec if cooldown_sec is not None else self.cooldown_sec
         with self._lock:
             now = self.time_fn()
-            self._cooldown_until = max(self._cooldown_until, now + cd)
+            b_key = None
+            if bucket is not None:
+                b_key = bucket.value if hasattr(bucket, "value") else str(bucket).lower()
+                if b_key in self._buckets:
+                    self._buckets[b_key].cooldown_until = max(self._buckets[b_key].cooldown_until, now + cd)
+            if b_key is None:
+                self._cooldown_until = max(self._cooldown_until, now + cd)
             self._last_rate_limit_time = now
             if action and bucket and source:
                 b_str = bucket.value if hasattr(bucket, "value") else str(bucket)
@@ -210,18 +218,33 @@ class AngelRateLimiter:
                 logger.warning(
                     f"Angel rate limit: action={action} bucket={b_str} source={source} attempt={att_str}"
                 )
-            logger.warning(f"Angel One rate limit encountered. Cooldown active for {cd:.1f}s.")
+            logger.warning(f"Angel One rate limit encountered ({b_key or 'all'}). Cooldown active for {cd:.1f}s.")
 
-    def is_in_cooldown(self) -> bool:
-        """Check if limiter is currently in reactive cooldown."""
-        with self._lock:
-            return self.time_fn() < self._cooldown_until
-
-    def remaining_cooldown(self) -> float:
-        """Get remaining cooldown duration in seconds."""
+    def is_in_cooldown(self, bucket: str | AngelBucket | None = None) -> bool:
+        """Check if limiter or a specific bucket is currently in reactive cooldown."""
         with self._lock:
             now = self.time_fn()
-            return max(0.0, self._cooldown_until - now)
+            if bucket is not None:
+                b_key = bucket.value if hasattr(bucket, "value") else str(bucket).lower()
+                target_bucket = self._buckets.get(b_key)
+                if target_bucket and now < target_bucket.cooldown_until:
+                    return True
+                return now < self._cooldown_until
+            return now < self._cooldown_until or any(now < b.cooldown_until for b in self._buckets.values())
+
+    def remaining_cooldown(self, bucket: str | AngelBucket | None = None) -> float:
+        """Get remaining cooldown duration in seconds for bucket (or max across limiter)."""
+        with self._lock:
+            now = self.time_fn()
+            if bucket is not None:
+                b_key = bucket.value if hasattr(bucket, "value") else str(bucket).lower()
+                target_bucket = self._buckets.get(b_key)
+                if target_bucket:
+                    return max(0.0, target_bucket.cooldown_until - now, self._cooldown_until - now)
+            rem = max(0.0, self._cooldown_until - now)
+            for b in self._buckets.values():
+                rem = max(rem, b.cooldown_until - now)
+            return max(0.0, rem)
 
     def reset(self) -> None:
         """Reset all bucket schedules and cooldown (primarily for test teardown)."""
@@ -231,6 +254,7 @@ class AngelRateLimiter:
             self._last_dispatch_time = 0.0
             for b in self._buckets.values():
                 b.last_scheduled = 0.0
+                b.cooldown_until = 0.0
 
     @contextmanager
     def throttle(

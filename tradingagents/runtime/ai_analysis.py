@@ -406,7 +406,7 @@ class AIAnalysis:
     def status(self):
         with self.lock:
             return {'auto_active': self.auto_active, 'configured': self.config is not None, 'state': self.state, 'progress': self.progress, 'error': self.error,
-                    'provider': self.config['llm_provider'] if self.config else None,
-                    'model': self.config['quick_think_llm'] if self.config else None,
+                    'provider': self.config.get('llm_provider') if self.config else None,
+                    'model': self.config.get('quick_think_llm') if self.config else None,
                     'worker_busy': bool(self.worker and self.worker.is_alive()),
                     'result': copy.deepcopy(self.result)}

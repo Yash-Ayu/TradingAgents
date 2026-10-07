@@ -44,6 +44,15 @@ SENSITIVE_PATTERNS = [
     re.compile(r"('totp'\s*:\s*')[^']+(')", re.IGNORECASE),
     re.compile(r'("api_key"\s*:\s*")[^"]+(")', re.IGNORECASE),
     re.compile(r"('api_key'\s*:\s*')[^']+(')", re.IGNORECASE),
+    # Dhan specific headers, tokens, and query params
+    re.compile(r'("access-token"\s*:\s*")[^"]+(")', re.IGNORECASE),
+    re.compile(r"('access-token'\s*:\s*')[^']+(')", re.IGNORECASE),
+    re.compile(r'(access-token:\s*)[^\s,]+', re.IGNORECASE),
+    re.compile(r'("accessToken"\s*:\s*")[^"]+(")', re.IGNORECASE),
+    re.compile(r"('accessToken'\s*:\s*')[^']+(')", re.IGNORECASE),
+    re.compile(r'([?&]pin=)[^&]+', re.IGNORECASE),
+    re.compile(r'([?&]totp=)[^&]+', re.IGNORECASE),
+    re.compile(r'([?&]token=)[^&]+', re.IGNORECASE),
     # SmartConnect full Headers dump: Headers: {'Authorization': ...}
     re.compile(r'Headers:\s*\{.*?\}', re.DOTALL),
 ]
@@ -73,6 +82,10 @@ class SecretRedactor:
             "ANGEL_MPIN",
             "ANGEL_PIN",
             "ANGEL_TOTP_SECRET",
+            "DHAN_CLIENT_ID",
+            "DHAN_PIN",
+            "DHAN_TOTP_SECRET",
+            "DHAN_ACCESS_TOKEN",
             "GOOGLE_API_KEY",
             "OPENAI_API_KEY",
             "ANTHROPIC_API_KEY",

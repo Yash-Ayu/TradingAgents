@@ -292,13 +292,15 @@ def test_7_scanner_rotation_works_with_centralized_limiter(tmp_path):
     assert res1['rotation_index'] == 0
     assert res1['next_rotation_index'] == 6  # 2 indices + 6 stocks
 
-    # Cycle 2
+    # Cycle 2 (advance cadence to simulate next scheduled 5-minute cycle)
+    service._last_scan_mono = 0.0
     service._scan_and_execute_fo(snapshot, account, 2)
     res2 = service.last_scanner_result
     assert res2['rotation_index'] == 6
     assert res2['next_rotation_index'] == 12
 
-    # Cycle 3
+    # Cycle 3 (advance cadence to simulate next scheduled 5-minute cycle)
+    service._last_scan_mono = 0.0
     service._scan_and_execute_fo(snapshot, account, 3)
     res3 = service.last_scanner_result
     assert res3['rotation_index'] == 12
@@ -434,8 +436,12 @@ def test_11_market_adapter_candles_rate_limited_fails_closed_when_fallback_forbi
         with pytest.raises(ValueError, match="angel_rate_limited"):
             adapter.get_candles('NIFTY', interval='5m', allow_fallback=False)
 
-        # Rate limiter cooldown MUST be active
+        # Rate limiter cooldown MUST be active for CANDLE bucket specifically
         assert limiter.is_in_cooldown() is True
+        assert limiter.is_in_cooldown(AngelBucket.CANDLE) is True
+        # Quote and Account buckets must NOT be blocked by candle rate limiting
+        assert limiter.is_in_cooldown(AngelBucket.QUOTE) is False
+        assert limiter.is_in_cooldown(AngelBucket.ACCOUNT) is False
         # ResearchMarketAdapter must NEVER be called when fallback is forbidden
         assert mock_research.call_count == 0
 
