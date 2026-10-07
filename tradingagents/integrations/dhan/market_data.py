@@ -188,7 +188,8 @@ class DhanMarketDataProvider:
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 quotes = data.get("data", {})
-                item = quotes.get(str(sec_id)) or {}
+                segment_quotes = quotes.get(seg, {}) if isinstance(quotes, dict) else {}
+                item = segment_quotes.get(str(sec_id)) or {}
                 ltp = float(item.get("last_price", 0.0) or 0.0)
                 if ltp > 0:
                     self._state = DhanMarketDataState.HEALTHY
